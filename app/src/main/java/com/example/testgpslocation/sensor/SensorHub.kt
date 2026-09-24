@@ -1,219 +1,400 @@
 package com.example.testgpslocation.sensor
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.location.GnssStatus
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import androidx.core.app.ActivityCompat
+import android.util.Log
+import androidx.core.content.ContextCompat
+import com.example.testgpslocation.engine.MotionSample
+import com.example.testgpslocation.engine.MotionState
 import com.example.testgpslocation.models.GpsPoint
-import com.google.android.gms.location.*
-import kotlin.math.*
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import kotlin.math.abs
+import kotlin.math.sqrt
 
-class SensorHub(private val context: Context) : SensorEventListener {
+/** What this phone can do; shown to the user when something important is missing. */
+data class DeviceCapabilities(
+    val hasGnss: Boolean,
+    val hasPlayServices: Boolean,
+    val hasLinearAcceleration: Boolean,
+    val hasAccelerometer: Boolean,
+    val hasRotationVector: Boolean,
+    val hasGyroscope: Boolean,
+    val hasBarometer: Boolean,
+    val hasStepDetector: Boolean
+)
 
-    interface SensorListener {
-        fun onGpsUpdate(point: GpsPoint)
-        fun onGpsUnavailable()
-        fun onMotionUpdate(distance: Double, speed: Double, heading: Float)
-        fun onPressureUpdate(pressure: Float, isRapidChange: Boolean)
+/**
+ * Location + IMU front end. All callbacks arrive on the main thread.
+ *
+ * Location sources:
+ *  - the satellite receiver (LocationManager GPS provider) → fixes marked isGnss = true;
+ *  - Google fused location (cell / Wi-Fi / GPS mix) → isGnss = false, used when there is no
+ *    satellite fix (e.g. underground with network);
+ *  - without Google Play services: the platform network provider instead of fused.
+ * "GPS lost" fires when no satellite fix arrived for [GPS_TIMEOUT_MS].
+ *
+ * Motion: one [MotionSample] every [SAMPLE_PERIOD_MS] with world-frame acceleration and a
+ * stationary / walking / moving classification. Falls back to the raw accelerometer (gravity
+ * removed with a low-pass filter) on phones without a linear-acceleration sensor.
+ */
+class SensorHub(context: Context) : SensorEventListener {
+
+    interface Listener {
+        fun onLocationFix(point: GpsPoint)
+        fun onGpsLost(elapsedMs: Long)
+        fun onMotionSample(sample: MotionSample)
+        fun onSatellites(inView: Int, usedInFix: Int) {}
     }
 
-    private var listener: SensorListener? = null
-    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
-    
+    private val appContext = context.applicationContext
+    private val sensorManager = appContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val locationManager = appContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    private val handler = Handler(Looper.getMainLooper())
+
     private val linearAccel = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
-    private val rotationVec = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-    private val pressureSensor = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
-    private val gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    private val rawAccel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    private val rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    private val pressure = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
+    private val stepDetector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
 
-    private var locationCallback: LocationCallback? = null
-    private var isTracking = false
-    private var lastFineLocationTime = 0L
-    private var gpsReportedLost = false
+    private val hasGnss = try { locationManager.allProviders.contains(LocationManager.GPS_PROVIDER) } catch (_: Exception) { false }
+    private val hasPlayServices = try {
+        GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(appContext) == ConnectionResult.SUCCESS
+    } catch (_: Exception) { false }
+    private val fusedClient: FusedLocationProviderClient? =
+        if (hasPlayServices) LocationServices.getFusedLocationProviderClient(appContext) else null
 
-    // Motion State
-    var velocity = 0.0; private set
-    var distance = 0.0; private set
-    var heading = 0f; private set
-    var isMoving = false; private set
+    val capabilities = DeviceCapabilities(
+        hasGnss = hasGnss,
+        hasPlayServices = hasPlayServices,
+        hasLinearAcceleration = linearAccel != null,
+        hasAccelerometer = rawAccel != null,
+        hasRotationVector = rotationVector != null,
+        hasGyroscope = gyroscope != null,
+        hasBarometer = pressure != null,
+        hasStepDetector = stepDetector != null
+    )
 
-    // 3D Calibration
-    private var forwardAxis = doubleArrayOf(0.0, 1.0, 0.0)
-    private var isAxisCalibrated = false
-    private val accelHistory = mutableListOf<DoubleArray>()
-    private var lastGpsSpeed = 0.0
-    private var rotationMatrix = FloatArray(9)
+    var listener: Listener? = null
+    var isRunning = false; private set
 
-    // Pressure Trend
-    private var lastPressure = 0f
-    private var pressureHistory = mutableListOf<Float>()
+    private var lastGnssFixMs = 0L
+    private var gpsLostReported = false
+    private var startedAtMs = 0L
 
-    private var lastAccelTimestamp = 0L
-    private var movingStartTime = 0L
-    private var stopStartTime = 0L
+    // Orientation (device -> world)
+    private val rotation = FloatArray(9).also { it[0] = 1f; it[4] = 1f; it[8] = 1f }
+    private var hasRotation = false
+    private val gravity = FloatArray(3)
+    private var gravityInitialised = false
 
-    companion object {
-        private const val MAX_SPEED = 30.0
-        private const val DECAY = 0.985
-        private const val GPS_TIMEOUT_MS = 15000L
-        private const val CALIB_HISTORY_SIZE = 50
-        private const val PRESSURE_HISTORY_SIZE = 10
-        private const val COARSE_ACCURACY_THRESHOLD = 2000f
-        private const val FINE_ACCURACY_THRESHOLD = 150f
+    // Current window accumulators
+    private var windowStartMs = 0L
+    private var sumEast = 0.0
+    private var sumNorth = 0.0
+    private var windowCount = 0
+
+    // Rolling buffers for classification
+    private val accelMagnitudes = RingBuffer(ROLLING_SAMPLES)
+    private val gyroMagnitudes = RingBuffer(ROLLING_SAMPLES)
+    private val stepTimes = ArrayDeque<Long>()
+    private var stillSinceMs = 0L
+
+    // Pressure: rapid change over a few seconds (stairs / escalator into a station)
+    private val pressureHistory = ArrayDeque<Pair<Long, Float>>()
+    private var pressureRapidChange = false
+
+    private val gpsWatchdog = object : Runnable {
+        override fun run() {
+            val now = SystemClock.elapsedRealtime()
+            val reference = if (lastGnssFixMs == 0L) startedAtMs else lastGnssFixMs
+            if (!gpsLostReported && now - reference > GPS_TIMEOUT_MS) {
+                gpsLostReported = true
+                listener?.onGpsLost(now)
+            }
+            handler.postDelayed(this, 1000L)
+        }
     }
 
-    fun setListener(l: SensorListener) { listener = l }
+    private val gnssListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) = deliver(location, isGnss = true)
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+        @Deprecated("Deprecated in Java")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    }
 
-    fun start() {
-        if (isTracking) return
-        startLocationUpdates()
-        linearAccel?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        rotationVec?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) }
-        pressureSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
-        gyroSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        isTracking = true
+    private val networkListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) = deliver(location, isGnss = false)
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+        @Deprecated("Deprecated in Java")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    }
+
+    private val fusedCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            // Without a satellite receiver, very accurate fused fixes are the best we have.
+            result.lastLocation?.let { deliver(it, isGnss = !hasGnss && it.accuracy <= NO_GNSS_TRUSTED_ACCURACY) }
+        }
+    }
+
+    private val gnssStatusCallback = object : GnssStatus.Callback() {
+        override fun onSatelliteStatusChanged(status: GnssStatus) {
+            var used = 0
+            for (i in 0 until status.satelliteCount) if (status.usedInFix(i)) used++
+            listener?.onSatellites(status.satelliteCount, used)
+        }
+    }
+
+    fun hasFineLocationPermission() =
+        ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasCoarseLocationPermission() =
+        ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    /** Returns false when no location permission at all is granted. */
+    @SuppressLint("MissingPermission") // checked above each request
+    fun start(): Boolean {
+        if (isRunning) return true
+        val fine = hasFineLocationPermission()
+        if (!fine && !hasCoarseLocationPermission()) return false
+        startedAtMs = SystemClock.elapsedRealtime()
+        gpsLostReported = false
+        lastGnssFixMs = 0L
+
+        if (fine && hasGnss) {
+            try {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, GNSS_INTERVAL_MS, 0f, gnssListener, Looper.getMainLooper())
+                locationManager.registerGnssStatusCallback(gnssStatusCallback, handler)
+            } catch (e: Exception) {
+                Log.w(TAG, "Satellite updates unavailable", e)
+            }
+        }
+        val fused = fusedClient
+        if (fused != null) {
+            val priority = if (fine) Priority.PRIORITY_HIGH_ACCURACY else Priority.PRIORITY_BALANCED_POWER_ACCURACY
+            val request = LocationRequest.Builder(priority, FUSED_INTERVAL_MS).setMinUpdateIntervalMillis(FUSED_INTERVAL_MS / 2).build()
+            try {
+                fused.requestLocationUpdates(request, fusedCallback, Looper.getMainLooper())
+                    .addOnFailureListener { e -> Log.w(TAG, "Fused location failed, using network provider", e); startNetworkProvider() }
+            } catch (e: Exception) {
+                Log.w(TAG, "Fused location unavailable", e)
+                startNetworkProvider()
+            }
+        } else {
+            startNetworkProvider()
+        }
+
+        val accelSensor = linearAccel ?: rawAccel
+        accelSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
+        rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
+        gyroscope?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
+        pressure?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler) }
+        if (stepDetector != null && hasActivityPermission()) {
+            sensorManager.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_NORMAL, handler)
+        }
+        handler.postDelayed(gpsWatchdog, 1000L)
+        isRunning = true
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startNetworkProvider() {
+        try {
+            if (locationManager.allProviders.contains(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, FUSED_INTERVAL_MS, 0f, networkListener, Looper.getMainLooper())
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Network provider unavailable", e)
+        }
     }
 
     fun stop() {
-        locationCallback?.let { fusedLocationClient.removeLocationUpdates(it) }
-        locationCallback = null
+        if (!isRunning) return
+        try { locationManager.removeUpdates(gnssListener) } catch (_: Exception) {}
+        try { locationManager.removeUpdates(networkListener) } catch (_: Exception) {}
+        try { locationManager.unregisterGnssStatusCallback(gnssStatusCallback) } catch (_: Exception) {}
+        try { fusedClient?.removeLocationUpdates(fusedCallback) } catch (_: Exception) {}
         sensorManager.unregisterListener(this)
-        isTracking = false
+        handler.removeCallbacks(gpsWatchdog)
+        isRunning = false
+        windowStartMs = 0L
+        stillSinceMs = 0L
     }
 
-    fun resetMotion() {
-        velocity = 0.0; distance = 0.0; lastAccelTimestamp = 0; movingStartTime = 0; stopStartTime = 0; isMoving = false
-    }
+    fun isLocationEnabled(): Boolean = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) locationManager.isLocationEnabled
+        else locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+    } catch (_: Exception) { true }
 
-    fun setInitialVelocity(v: Double) {
-        velocity = v.coerceIn(0.0, MAX_SPEED); isMoving = velocity >= 1.0; if (!isMoving) velocity = 0.0
-    }
+    private fun hasActivityPermission() =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
 
-    fun provideGpsSpeed(speed: Double) {
-        if (speed > lastGpsSpeed + 0.5 && accelHistory.isNotEmpty()) calibrateAxis()
-        lastGpsSpeed = speed
-    }
-
-    fun checkGpsStatus() {
+    private fun deliver(loc: Location, isGnss: Boolean) {
         val now = SystemClock.elapsedRealtime()
-        if (lastFineLocationTime == 0L || now - lastFineLocationTime > GPS_TIMEOUT_MS) {
-            if (!gpsReportedLost) {
-                listener?.onGpsUnavailable()
-                gpsReportedLost = true
-            }
+        // Stale fixes (e.g. a cached "last location" delivered late) are ignored.
+        val fixElapsed = loc.elapsedRealtimeNanos / 1_000_000
+        if (fixElapsed > 0 && now - fixElapsed > STALE_FIX_MS) return
+        if (isGnss) {
+            lastGnssFixMs = now
+            gpsLostReported = false
         }
-    }
-
-    private fun startLocationUpdates() {
-        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
-        
-        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000).setMinUpdateIntervalMillis(1000).build()
-        locationCallback = object : LocationCallback() {
-            override fun onLocationResult(res: LocationResult) {
-                val loc = res.lastLocation ?: return
-                val isCoarse = loc.accuracy > FINE_ACCURACY_THRESHOLD
-                if (loc.accuracy > COARSE_ACCURACY_THRESHOLD) return
-
-                val now = SystemClock.elapsedRealtime()
-                if (isCoarse && now - lastFineLocationTime < 5000) return
-                
-                if (!isCoarse) {
-                    lastFineLocationTime = now
-                    gpsReportedLost = false
-                }
-                
-                val point = GpsPoint(loc.latitude, loc.longitude, loc.accuracy, loc.time, if (loc.hasSpeed()) loc.speed else 0f, if (loc.hasBearing()) loc.bearing else 0f, isCoarse)
-                listener?.onGpsUpdate(point)
-            }
-        }
-        fusedLocationClient.requestLocationUpdates(req, locationCallback!!, Looper.getMainLooper())
+        @Suppress("DEPRECATION")
+        val mock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) loc.isMock else loc.isFromMockProvider
+        listener?.onLocationFix(
+            GpsPoint(
+                latitude = loc.latitude,
+                longitude = loc.longitude,
+                accuracy = if (loc.hasAccuracy()) loc.accuracy else 999f,
+                timestamp = loc.time,
+                speedMeterPerSecond = if (loc.hasSpeed()) loc.speed else 0f,
+                bearingDegree = if (loc.hasBearing()) loc.bearing else 0f,
+                hasSpeed = loc.hasSpeed(),
+                hasBearing = loc.hasBearing(),
+                elapsedRealtimeMs = if (fixElapsed > 0) fixElapsed else now,
+                isGnss = isGnss,
+                isMock = mock
+            )
+        )
     }
 
     override fun onSensorChanged(event: SensorEvent) {
         when (event.sensor.type) {
-            Sensor.TYPE_LINEAR_ACCELERATION -> handleAccel(event)
-            Sensor.TYPE_ROTATION_VECTOR -> handleRotation(event)
-            Sensor.TYPE_PRESSURE -> handlePressure(event)
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                try {
+                    SensorManager.getRotationMatrixFromVector(rotation, event.values)
+                    hasRotation = true
+                } catch (_: IllegalArgumentException) { /* some devices send 5 values; ignore bad sample */ }
+            }
+            Sensor.TYPE_LINEAR_ACCELERATION -> onAccel(event.values[0], event.values[1], event.values[2])
+            Sensor.TYPE_ACCELEROMETER -> {
+                // Fallback: remove gravity with a low-pass filter.
+                if (!gravityInitialised) { event.values.copyInto(gravity, 0, 0, 3); gravityInitialised = true }
+                for (i in 0..2) gravity[i] = GRAVITY_ALPHA * gravity[i] + (1 - GRAVITY_ALPHA) * event.values[i]
+                onAccel(event.values[0] - gravity[0], event.values[1] - gravity[1], event.values[2] - gravity[2])
+            }
+            Sensor.TYPE_GYROSCOPE -> {
+                val x = event.values[0]; val y = event.values[1]; val z = event.values[2]
+                gyroMagnitudes.add(sqrt((x * x + y * y + z * z).toDouble()))
+            }
+            Sensor.TYPE_PRESSURE -> onPressure(event.values[0])
+            Sensor.TYPE_STEP_DETECTOR -> stepTimes.addLast(SystemClock.elapsedRealtime())
         }
     }
 
-    private fun handleAccel(event: SensorEvent) {
-        val ts = event.timestamp
-        if (lastAccelTimestamp == 0L) { lastAccelTimestamp = ts; return }
-        val dt = (ts - lastAccelTimestamp) / 1_000_000_000.0
-        lastAccelTimestamp = ts
-        if (dt <= 0 || dt > 1.0) return
-        val ax = event.values[0].toDouble(); val ay = event.values[1].toDouble(); val az = event.values[2].toDouble()
-        
-        // Calibration accumulation using monotonic time for fine location age check
-        val fineLocationAge = SystemClock.elapsedRealtime() - lastFineLocationTime
-        if (!isAxisCalibrated || fineLocationAge < 10000) {
-            accelHistory.add(doubleArrayOf(ax, ay, az))
-            if (accelHistory.size > CALIB_HISTORY_SIZE) accelHistory.removeAt(0)
+    private fun onAccel(xf: Float, yf: Float, zf: Float) {
+        val x = xf.toDouble(); val y = yf.toDouble(); val z = zf.toDouble()
+        if (x.isNaN() || y.isNaN() || z.isNaN()) return
+        accelMagnitudes.add(sqrt(x * x + y * y + z * z))
+        if (hasRotation) {
+            // Rotation matrix maps device coordinates to world (East, North, Up).
+            sumEast += rotation[0] * x + rotation[1] * y + rotation[2] * z
+            sumNorth += rotation[3] * x + rotation[4] * y + rotation[5] * z
         }
-
-        val mag = sqrt(ax * ax + ay * ay + az * az)
-        val signedAccel = if (isAxisCalibrated) projectAccel(ax, ay, az) else mag
+        windowCount++
 
         val now = SystemClock.elapsedRealtime()
-        if (mag > 0.35) { if (movingStartTime == 0L) movingStartTime = now; if (now - movingStartTime >= 1500) isMoving = true } else movingStartTime = 0
-        if (mag < 0.15 && velocity < 0.5) { if (stopStartTime == 0L) stopStartTime = now; if (now - stopStartTime >= 3000) { velocity = 0.0; isMoving = false } } else stopStartTime = 0
-        if (isMoving) { 
-            velocity = (velocity + signedAccel * dt) * DECAY
-            velocity = velocity.coerceIn(-MAX_SPEED, MAX_SPEED)
-            distance += abs(velocity) * dt 
-        }
-        listener?.onMotionUpdate(distance, velocity, heading)
+        if (windowStartMs == 0L) { windowStartMs = now; return }
+        val elapsed = now - windowStartMs
+        if (elapsed < SAMPLE_PERIOD_MS) return
+
+        val sample = MotionSample(
+            elapsedMs = now,
+            dtSec = (elapsed / 1000.0).coerceAtMost(1.0), // after a pause (Doze) do not integrate a huge step
+            state = classify(now),
+            stationaryForMs = if (stillSinceMs == 0L) 0L else now - stillSinceMs,
+            accelEast = if (windowCount > 0) sumEast / windowCount else 0.0,
+            accelNorth = if (windowCount > 0) sumNorth / windowCount else 0.0,
+            pressureRapidChange = pressureRapidChange
+        )
+        windowStartMs = now; sumEast = 0.0; sumNorth = 0.0; windowCount = 0
+        listener?.onMotionSample(sample)
     }
 
-    private fun handleRotation(event: SensorEvent) {
-        val oldRotation = rotationMatrix.copyOf()
-        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-        if (isAxisCalibrated && oldRotation[0] != 0f) {
-            val dot = rotationMatrix[0]*oldRotation[0] + rotationMatrix[4]*oldRotation[4] + rotationMatrix[8]*oldRotation[8]
-            if (dot < 0.96) { isAxisCalibrated = false; accelHistory.clear() }
-        }
-        updateWorldHeading()
-        listener?.onMotionUpdate(distance, velocity, heading)
-    }
-
-    private fun handlePressure(event: SensorEvent) {
-        val p = event.values[0]
-        if (lastPressure == 0f) { lastPressure = p; return }
-        val diff = abs(p - lastPressure)
-        pressureHistory.add(p)
-        if (pressureHistory.size > PRESSURE_HISTORY_SIZE) pressureHistory.removeAt(0)
-        val isRapid = diff > 0.4f
-        listener?.onPressureUpdate(p, isRapid)
-        lastPressure = p
-    }
-
-    private fun projectAccel(ax: Double, ay: Double, az: Double) = (ax * forwardAxis[0] + ay * forwardAxis[1] + az * forwardAxis[2])
-
-    private fun calibrateAxis() {
-        if (accelHistory.isEmpty()) return
-        val avg = doubleArrayOf(0.0, 0.0, 0.0)
-        accelHistory.forEach { avg[0] += it[0]; avg[1] += it[1]; avg[2] += it[2] }
-        val norm = sqrt(avg[0].pow(2) + avg[1].pow(2) + avg[2].pow(2))
-        if (norm > 0.1) {
-            forwardAxis[0] = avg[0] / norm; forwardAxis[1] = avg[1] / norm; forwardAxis[2] = avg[2] / norm
-            isAxisCalibrated = true
+    private fun classify(now: Long): MotionState {
+        while (stepTimes.isNotEmpty() && now - stepTimes.first() > STEP_WINDOW_MS) stepTimes.removeFirst()
+        val accelStd = accelMagnitudes.std()
+        if (accelStd == null) { stillSinceMs = 0L; return MotionState.MOVING } // warming up: not enough data yet
+        val gyroMean = gyroMagnitudes.mean()
+        val walking = stepTimes.size >= MIN_STEPS_FOR_WALKING || accelStd > WALKING_ACCEL_STD
+        val stillThreshold = if (linearAccel != null) STILL_ACCEL_STD else STILL_ACCEL_STD_RAW
+        val still = !walking && accelStd < stillThreshold && (gyroscope == null || gyroMean < STILL_GYRO_MEAN)
+        if (still) { if (stillSinceMs == 0L) stillSinceMs = now } else stillSinceMs = 0L
+        return when {
+            walking -> MotionState.WALKING
+            still && now - stillSinceMs >= STILL_CONFIRM_MS -> MotionState.STATIONARY
+            else -> MotionState.MOVING
         }
     }
 
-    private fun updateWorldHeading() {
-        val worldX = rotationMatrix[0] * forwardAxis[0] + rotationMatrix[1] * forwardAxis[1] + rotationMatrix[2] * forwardAxis[2]
-        val worldY = rotationMatrix[3] * forwardAxis[0] + rotationMatrix[4] * forwardAxis[1] + rotationMatrix[5] * forwardAxis[2]
-        var h = Math.toDegrees(atan2(worldX, worldY)).toFloat()
-        if (h < 0) h += 360f
-        heading = h
+    private fun onPressure(hPa: Float) {
+        if (hPa.isNaN() || hPa <= 0f) return
+        val now = SystemClock.elapsedRealtime()
+        pressureHistory.addLast(now to hPa)
+        while (pressureHistory.isNotEmpty() && now - pressureHistory.first().first > PRESSURE_WINDOW_MS) pressureHistory.removeFirst()
+        pressureRapidChange = abs(hPa - pressureHistory.first().second) > PRESSURE_RAPID_DELTA_HPA
     }
 
-    override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    private class RingBuffer(private val capacity: Int) {
+        private val data = DoubleArray(capacity)
+        private var size = 0
+        private var next = 0
+        fun add(v: Double) { data[next] = v; next = (next + 1) % capacity; if (size < capacity) size++ }
+        fun mean(): Double = if (size == 0) 0.0 else (0 until size).sumOf { data[it] } / size
+        /** Standard deviation, or null while there are too few samples to judge. */
+        fun std(): Double? {
+            if (size < MIN_SAMPLES_FOR_STD) return null
+            val m = mean()
+            return sqrt((0 until size).sumOf { (data[it] - m) * (data[it] - m) } / size)
+        }
+    }
+
+    companion object {
+        private const val TAG = "SensorHub"
+        const val SAMPLE_PERIOD_MS = 100L
+        const val GPS_TIMEOUT_MS = 6_000L
+        private const val GNSS_INTERVAL_MS = 1_000L
+        private const val FUSED_INTERVAL_MS = 2_000L
+        private const val STALE_FIX_MS = 30_000L
+        private const val NO_GNSS_TRUSTED_ACCURACY = 25f
+        private const val ROLLING_SAMPLES = 100 // ~2 s at SENSOR_DELAY_GAME (50 Hz)
+        private const val MIN_SAMPLES_FOR_STD = 10
+        private const val STEP_WINDOW_MS = 3_000L
+        private const val MIN_STEPS_FOR_WALKING = 3
+        private const val WALKING_ACCEL_STD = 1.2
+        private const val STILL_ACCEL_STD = 0.06
+        private const val STILL_ACCEL_STD_RAW = 0.09 // raw accelerometer is noisier
+        private const val STILL_GYRO_MEAN = 0.05
+        private const val STILL_CONFIRM_MS = 1_000L
+        private const val GRAVITY_ALPHA = 0.9f
+        private const val PRESSURE_WINDOW_MS = 10_000L
+        private const val PRESSURE_RAPID_DELTA_HPA = 0.4f
+    }
 }

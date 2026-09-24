@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">GPS Logger</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="clear">Clear</string>
+    <string name="no_fix">No fix yet</string>
+    <string name="location_off">Location is turned off — tap here to turn it on</string>
+    <string name="permission_needed">Location permission is required</string>
+</resources>

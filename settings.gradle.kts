@@ -17,6 +17,5 @@ dependencyResolutionManagement {
 rootProject.name = "TestGPSLocation"
 include(":app")
 include(":core")
-include(":trainbox")
-include(":testerapp")
+include(":gpslogger")
  

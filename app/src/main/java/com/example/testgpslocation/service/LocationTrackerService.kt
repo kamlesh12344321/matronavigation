@@ -1,127 +1,154 @@
 package com.example.testgpslocation.service
 
-import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.location.Location
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import android.os.Looper
-import androidx.core.app.ActivityCompat
+import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.google.android.gms.location.*
 import com.example.testgpslocation.MainActivity
+import com.example.testgpslocation.engine.NavigationController
+import com.example.testgpslocation.utils.NetworkStatus
 import com.example.testgpslocation.utils.TelemetryLogger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
+/**
+ * Foreground service that keeps navigation running with the screen off and writes every
+ * position (GPS, track-constrained or dead-reckoned) plus navigation events to the log file.
+ */
 class LocationTrackerService : Service() {
 
-    private lateinit var fusedLocationClient: FusedLocationProviderClient
-    private lateinit var locationCallback: LocationCallback
-
-    companion object {
-        private const val CHANNEL_ID = "LocationTrackerChannel"
-        private const val NOTIFICATION_ID = 2001
-    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var lastNotificationText: String? = null
+    private var lastNotificationMs = 0L
+    private var started = false
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
-        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        startForeground(NOTIFICATION_ID, createNotification())
-        startLocationUpdates()
-        TelemetryLogger.logCustom(this, "LocationTrackerService started in :app")
+        NavigationController.init(this)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, buildNotification("Starting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification("Starting…"))
+            }
+        } catch (e: Exception) {
+            // Location permission revoked, or restarted from the background where a location
+            // foreground service is not allowed.
+            Log.w(TAG, "Cannot start foreground service", e)
+            stopSelf()
+            return
+        }
+        if (!NavigationController.acquire(CLIENT)) {
+            Log.w(TAG, "Location permission missing")
+            stopSelf()
+            return
+        }
+        // Keep the CPU running with the screen off: motion sensors are only delivered while
+        // the CPU is awake, and underground navigation depends on them.
+        wakeLock = getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MetroNavigator:navigation")
+            ?.apply { setReferenceCounted(false); acquire(MAX_WAKE_LOCK_MS) }
+        started = true
+        isRunning.value = true
+        TelemetryLogger.logCustom(this, "Logging started")
+
+        scope.launch {
+            NavigationController.positions.collect { p ->
+                val extra = buildString {
+                    append(String.format(java.util.Locale.US, "Error: ±%.0f m", p.uncertaintyMeters))
+                    p.gpsAccuracyMeters?.let { append(String.format(java.util.Locale.US, " | GPS accuracy: %.0f m", it)) }
+                    append(" | Satellites used: ").append(p.satellitesUsed)
+                    p.lineName?.let { append(" | Line: ").append(it) }
+                    p.nextStation?.let { append(" | Next: ").append(it) }
+                    if (p.mock) append(" | MOCK LOCATION")
+                }
+                TelemetryLogger.log(
+                    this@LocationTrackerService, p.timestamp, p.latitude, p.longitude, p.source.label,
+                    p.speedMps.toFloat(), if (p.gpsAvailable) "Acquired" else "Lost", NetworkStatus.label(this@LocationTrackerService),
+                    extra
+                )
+            }
+        }
+        scope.launch {
+            NavigationController.messages.collect { TelemetryLogger.logCustom(this@LocationTrackerService, "EVENT: $it") }
+        }
+        scope.launch {
+            NavigationController.state.collect { s ->
+                val text = buildString {
+                    append(s.status)
+                    s.nextStation?.let { append(" · next: ").append(it) }
+                    s.distanceToNextMeters?.let { append(String.format(java.util.Locale.US, " (%.0f m)", it)) }
+                }
+                updateNotification(text)
+            }
+        }
     }
 
-    private fun createNotification(): Notification {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Background Telemetry Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-        }
+    private fun updateNotification(text: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (text == lastNotificationText || now - lastNotificationMs < 3000L) return
+        lastNotificationText = text
+        lastNotificationMs = now
+        getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, buildNotification(text))
+    }
 
-        val intent = Intent(this, MainActivity::class.java)
+    private fun buildNotification(text: String): Notification {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Metro navigation & logging", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent,
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Telemetry Tracking Active (:app)")
-            .setContentText("Logging location & network telemetry to file...")
+            .setContentTitle("Metro Navigator logging")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
     }
 
-    private fun startLocationUpdates() {
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 4000L)
-            .setMinUpdateIntervalMillis(2000L)
-            .build()
-
-        locationCallback = object : LocationCallback() {
-            override fun onLocationResult(result: LocationResult) {
-                val location = result.lastLocation ?: return
-                recordTelemetry(location)
-            }
-        }
-
-        if (ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            fusedLocationClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
-        }
-    }
-
-    private fun recordTelemetry(location: Location) {
-        val lat = location.latitude
-        val lon = location.longitude
-        val speed = location.speed
-        val source = if (location.hasAccuracy() && location.accuracy < 200f) "GPS" else "DR"
-        val gpsStatus = "Acquired"
-        val networkStatus = if (isNetworkConnected(this)) "Connected" else "Lost"
-
-        TelemetryLogger.log(this, lat, lon, source, speed, gpsStatus, networkStatus)
-    }
-
-    private fun isNetworkConnected(context: Context): Boolean {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val network = cm.activeNetwork ?: return false
-            val capabilities = cm.getNetworkCapabilities(network) ?: return false
-            return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        } else {
-            @Suppress("DEPRECATION")
-            val activeNetwork = cm.activeNetworkInfo
-            @Suppress("DEPRECATION")
-            return activeNetwork != null && activeNetwork.isConnected
-        }
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        super.onDestroy()
-        if (::fusedLocationClient.isInitialized && ::locationCallback.isInitialized) {
-            fusedLocationClient.removeLocationUpdates(locationCallback)
+        scope.cancel()
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+        if (started) {
+            NavigationController.release(CLIENT)
+            TelemetryLogger.logCustom(this, "Logging stopped")
         }
-        TelemetryLogger.logCustom(this, "LocationTrackerService stopped in :app")
+        isRunning.value = false
+        super.onDestroy()
+    }
+
+    companion object {
+        /** Whether logging is currently active (for the UI). */
+        val isRunning = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+        private const val TAG = "LocationTrackerService"
+        private const val CHANNEL_ID = "LocationTrackerChannel"
+        private const val NOTIFICATION_ID = 2001
+        private const val CLIENT = "service"
+        private const val MAX_WAKE_LOCK_MS = 12 * 60 * 60 * 1000L // safety cap: 12 h
     }
 }

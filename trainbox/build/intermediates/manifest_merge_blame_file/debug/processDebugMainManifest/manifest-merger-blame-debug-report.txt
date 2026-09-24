@@ -1,0 +1,117 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.example.trainbox"
+4    android:versionCode="1"
+5    android:versionName="1.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="24"
+9        android:targetSdkVersion="34" />
+10
+11    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+11-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:4:5-79
+11-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:4:22-76
+12    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+12-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:5:5-81
+12-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:5:22-78
+13    <uses-permission android:name="android.permission.INTERNET" />
+13-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:6:5-67
+13-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:6:22-64
+14    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+14-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:7:5-79
+14-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:7:22-76
+15    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+15-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:8:5-77
+15-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:8:22-74
+16    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+16-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:9:5-86
+16-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:9:22-83
+17    <uses-permission
+17-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:10:5-108
+18        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+18-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:10:22-78
+19        android:maxSdkVersion="28" />
+19-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:10:79-105
+20    <uses-permission
+20-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:11:5-107
+21        android:name="android.permission.READ_EXTERNAL_STORAGE"
+21-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:11:22-77
+22        android:maxSdkVersion="32" />
+22-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:11:78-104
+23
+24    <permission
+24-->[androidx.core:core:1.9.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/44cc5326da7383d2e656f31065994a2d/transformed/core-1.9.0/AndroidManifest.xml:22:5-24:47
+25        android:name="com.example.trainbox.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+25-->[androidx.core:core:1.9.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/44cc5326da7383d2e656f31065994a2d/transformed/core-1.9.0/AndroidManifest.xml:23:9-81
+26        android:protectionLevel="signature" />
+26-->[androidx.core:core:1.9.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/44cc5326da7383d2e656f31065994a2d/transformed/core-1.9.0/AndroidManifest.xml:24:9-44
+27
+28    <uses-permission android:name="com.example.trainbox.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+28-->[androidx.core:core:1.9.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/44cc5326da7383d2e656f31065994a2d/transformed/core-1.9.0/AndroidManifest.xml:26:5-97
+28-->[androidx.core:core:1.9.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/44cc5326da7383d2e656f31065994a2d/transformed/core-1.9.0/AndroidManifest.xml:26:22-94
+29
+30    <application
+30-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:13:5-31:19
+31        android:allowBackup="true"
+31-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:14:9-35
+32        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+32-->[androidx.core:core:1.9.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/44cc5326da7383d2e656f31065994a2d/transformed/core-1.9.0/AndroidManifest.xml:28:18-86
+33        android:debuggable="true"
+34        android:extractNativeLibs="false"
+35        android:label="Trainbox Telemetry"
+35-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:15:9-43
+36        android:supportsRtl="true"
+36-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:16:9-35
+37        android:theme="@style/Theme.AppCompat.Light.DarkActionBar" >
+37-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:17:9-67
+38        <activity
+38-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:18:9-25:20
+39            android:name="com.example.trainbox.TrainMainActivity"
+39-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:19:13-46
+40            android:exported="true" >
+40-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:20:13-36
+41            <intent-filter>
+41-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:21:13-24:29
+42                <action android:name="android.intent.action.MAIN" />
+42-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:22:17-69
+42-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:22:25-66
+43
+44                <category android:name="android.intent.category.LAUNCHER" />
+44-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:23:17-77
+44-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:23:27-74
+45            </intent-filter>
+46        </activity>
+47
+48        <service
+48-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:27:9-30:56
+49            android:name="com.example.trainbox.service.LocationTrackerService"
+49-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:28:13-59
+50            android:exported="false"
+50-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:29:13-37
+51            android:foregroundServiceType="location" />
+51-->/Users/kamleshkumarpatel/TestGPSLocation/trainbox/src/main/AndroidManifest.xml:30:13-53
+52
+53        <provider
+53-->[androidx.emoji2:emoji2:1.2.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/c45caf28be233aed22e80d1244e4a926/transformed/emoji2-1.2.0/AndroidManifest.xml:24:9-32:20
+54            android:name="androidx.startup.InitializationProvider"
+54-->[androidx.emoji2:emoji2:1.2.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/c45caf28be233aed22e80d1244e4a926/transformed/emoji2-1.2.0/AndroidManifest.xml:25:13-67
+55            android:authorities="com.example.trainbox.androidx-startup"
+55-->[androidx.emoji2:emoji2:1.2.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/c45caf28be233aed22e80d1244e4a926/transformed/emoji2-1.2.0/AndroidManifest.xml:26:13-68
+56            android:exported="false" >
+56-->[androidx.emoji2:emoji2:1.2.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/c45caf28be233aed22e80d1244e4a926/transformed/emoji2-1.2.0/AndroidManifest.xml:27:13-37
+57            <meta-data
+57-->[androidx.emoji2:emoji2:1.2.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/c45caf28be233aed22e80d1244e4a926/transformed/emoji2-1.2.0/AndroidManifest.xml:29:13-31:52
+58                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+58-->[androidx.emoji2:emoji2:1.2.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/c45caf28be233aed22e80d1244e4a926/transformed/emoji2-1.2.0/AndroidManifest.xml:30:17-75
+59                android:value="androidx.startup" />
+59-->[androidx.emoji2:emoji2:1.2.0] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/c45caf28be233aed22e80d1244e4a926/transformed/emoji2-1.2.0/AndroidManifest.xml:31:17-49
+60            <meta-data
+60-->[androidx.lifecycle:lifecycle-process:2.4.1] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/3bd247c443861315e39d857032d14fc7/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:31:13-33:52
+61                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
+61-->[androidx.lifecycle:lifecycle-process:2.4.1] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/3bd247c443861315e39d857032d14fc7/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:32:17-78
+62                android:value="androidx.startup" />
+62-->[androidx.lifecycle:lifecycle-process:2.4.1] /Users/kamleshkumarpatel/.gradle/caches/8.8/transforms/3bd247c443861315e39d857032d14fc7/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:33:17-49
+63        </provider>
+64    </application>
+65
+66</manifest>

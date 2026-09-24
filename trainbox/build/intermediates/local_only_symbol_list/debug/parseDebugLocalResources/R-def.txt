@@ -1,0 +1,11 @@
+R_DEF: Internal format may change without notice
+local
+id btnSimulateMove
+id btnStartLogging
+id btnStopLogging
+id tvLogFilePath
+id tvStatus
+id tvTelemetry
+id tvTitle
+layout activity_train_main
+string app_name

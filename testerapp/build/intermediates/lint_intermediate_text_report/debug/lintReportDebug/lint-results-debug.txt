@@ -1,0 +1,159 @@
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/build.gradle.kts:13: Warning: Not targeting the latest versions of Android; compatibility modes apply. Consider testing and updating this version. Consult the android.os.Build.VERSION_CODES javadoc for details. [OldTargetApi]
+        targetSdk = 34
+        ~~~~~~~~~~~~~~
+
+   Explanation for issues of type "OldTargetApi":
+   When your application runs on a version of Android that is more recent than
+   your targetSdkVersion specifies that it has been tested with, various
+   compatibility modes kick in. This ensures that your application continues
+   to work, but it may look out of place. For example, if the targetSdkVersion
+   is less than 14, your app may get an option button in the UI.
+
+   To fix this issue, set the targetSdkVersion to the highest available value.
+   Then test your app to make sure everything works correctly. You may want to
+   consult the compatibility notes to see what changes apply to each version
+   you are adding support for:
+   https://developer.android.com/reference/android/os/Build.VERSION_CODES.html
+   as well as follow this guide:
+   https://developer.android.com/distribute/best-practices/develop/target-sdk.
+   html
+
+   https://developer.android.com/distribute/best-practices/develop/target-sdk.html
+
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/build.gradle.kts:42: Warning: A newer version of com.google.android.material:material than 1.8.0 is available: 1.10.0 [GradleDependency]
+    implementation("com.google.android.material:material:1.8.0")
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   Explanation for issues of type "GradleDependency":
+   This detector looks for usages of libraries where the version you are using
+   is not the current stable release. Using older versions is fine, and there
+   are cases where you deliberately want to stick with an older version.
+   However, you may simply not be aware that a more recent version is
+   available, and that is what this lint check helps find.
+
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:7: Warning: Possible overdraw: Root element paints background #F5F6F8 with a theme that also paints a background (inferred theme is @style/Theme.AppCompat.Light.DarkActionBar) [Overdraw]
+    android:background="#F5F6F8">
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   Explanation for issues of type "Overdraw":
+   If you set a background drawable on a root view, then you should use a
+   custom theme where the theme background is null. Otherwise, the theme
+   background will be painted first, only to have your custom background
+   completely cover it; this is called "overdraw".
+
+   NOTE: This detector relies on figuring out which layouts are associated
+   with which activities based on scanning the Java code, and it's currently
+   doing that using an inexact pattern matching algorithm. Therefore, it can
+   incorrectly conclude which activity the layout is associated with and then
+   wrongly complain that a background-theme is hidden.
+
+   If you want your custom background on multiple pages, then you should
+   consider making a custom theme with your custom background and just using
+   that theme instead of a root element background.
+
+   Of course it's possible that your custom drawable is translucent and you
+   want it to be mixed with the background. However, you will get better
+   performance if you pre-mix the background with your drawable and use that
+   resulting image or color as a custom theme background instead.
+
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/AndroidManifest.xml:14: Warning: Should explicitly set android:icon, there is no default [MissingApplicationIcon]
+    <application
+     ~~~~~~~~~~~
+
+   Explanation for issues of type "MissingApplicationIcon":
+   You should set an icon for the application as whole because there is no
+   default. This attribute must be set as a reference to a drawable resource
+   containing the image (for example @drawable/icon).
+
+   https://developer.android.com/studio/publish/preparing#publishing-configure
+
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:189: Warning: Buttons in button bars should be borderless; use style="?android:attr/buttonBarButtonStyle" (and ?android:attr/buttonBarStyle on the parent) [ButtonStyle]
+                    <Button
+                     ~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:198: Warning: Buttons in button bars should be borderless; use style="?android:attr/buttonBarButtonStyle" (and ?android:attr/buttonBarStyle on the parent) [ButtonStyle]
+                    <Button
+                     ~~~~~~
+
+   Explanation for issues of type "ButtonStyle":
+   Button bars typically use a borderless style for the buttons. Set the
+   style="?android:attr/buttonBarButtonStyle" attribute on each of the
+   buttons, and set style="?android:attr/buttonBarStyle" on the parent layout
+
+   https://d.android.com/r/studio-ui/designer/material/dialogs
+
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:18: Warning: Hardcoded string "GPS & Network Simulation Dashboard", should use @string resource [HardcodedText]
+            android:text="GPS &amp; Network Simulation Dashboard"
+            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:43: Warning: Hardcoded string "Select Simulation Mode", should use @string resource [HardcodedText]
+                    android:text="Select Simulation Mode"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:60: Warning: Hardcoded string "Mode 1: Normal GPS & Network", should use @string resource [HardcodedText]
+                        android:text="Mode 1: Normal GPS &amp; Network"
+                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:67: Warning: Hardcoded string "Mode 2: Flight Mode (Offline)", should use @string resource [HardcodedText]
+                        android:text="Mode 2: Flight Mode (Offline)"
+                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:74: Warning: Hardcoded string "Mode 3: Low Network (Simulated Latency)", should use @string resource [HardcodedText]
+                        android:text="Mode 3: Low Network (Simulated Latency)"
+                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:100: Warning: Hardcoded string "System Status Dashboard", should use @string resource [HardcodedText]
+                    android:text="System Status Dashboard"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:110: Warning: Hardcoded string "Current Active Mode: Normal", should use @string resource [HardcodedText]
+                    android:text="Current Active Mode: Normal"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:118: Warning: Hardcoded string "GPS / Dead Reckoning: GPS Active (Normal)", should use @string resource [HardcodedText]
+                    android:text="GPS / Dead Reckoning: GPS Active (Normal)"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:126: Warning: Hardcoded string "Network Simulation: Online (0ms Latency)", should use @string resource [HardcodedText]
+                    android:text="Network Simulation: Online (0ms Latency)"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:134: Warning: Hardcoded string "Coordinates & Speed: 12.9716, 77.5946 | 0.0 m/s", should use @string resource [HardcodedText]
+                    android:text="Coordinates &amp; Speed: 12.9716, 77.5946 | 0.0 m/s"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:142: Warning: Hardcoded string "Route Cache Status: Cache Miss (Fresh Query)", should use @string resource [HardcodedText]
+                    android:text="Route Cache Status: Cache Miss (Fresh Query)"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:166: Warning: Hardcoded string "Simulation, Logging & Verification Actions", should use @string resource [HardcodedText]
+                    android:text="Simulation, Logging &amp; Verification Actions"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:176: Warning: Hardcoded string "Log File: --", should use @string resource [HardcodedText]
+                    android:text="Log File: --"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:195: Warning: Hardcoded string "Start Logging", should use @string resource [HardcodedText]
+                        android:text="Start Logging"
+                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:204: Warning: Hardcoded string "Stop Logging", should use @string resource [HardcodedText]
+                        android:text="Stop Logging"
+                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:212: Warning: Hardcoded string "Simulate Location & Route Lookup", should use @string resource [HardcodedText]
+                    android:text="Simulate Location &amp; Route Lookup"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:219: Warning: Hardcoded string "Verify Offline Cache & Fallback", should use @string resource [HardcodedText]
+                    android:text="Verify Offline Cache &amp; Fallback"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:226: Warning: Hardcoded string "Clear Verification Logs", should use @string resource [HardcodedText]
+                    android:text="Clear Verification Logs" />
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:248: Warning: Hardcoded string "Verification Logs & Confidence Scoring", should use @string resource [HardcodedText]
+                    android:text="Verification Logs &amp; Confidence Scoring"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/kamleshkumarpatel/TestGPSLocation/testerapp/src/main/res/layout/activity_tester_main.xml:258: Warning: Hardcoded string "System ready for testing across network conditions.n", should use @string resource [HardcodedText]
+                    android:text="System ready for testing across network conditions.\n"
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   Explanation for issues of type "HardcodedText":
+   Hardcoding text attributes directly in layout files is bad for several
+   reasons:
+
+   * When creating configuration variations (for example for landscape or
+   portrait) you have to repeat the actual text (and keep it up to date when
+   making changes)
+
+   * The application cannot be translated to other languages by just adding
+   new translations for existing string resources.
+
+   There are quickfixes to automatically extract this hardcoded string into a
+   resource lookup.
+
+0 errors, 26 warnings

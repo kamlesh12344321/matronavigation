@@ -1,92 +1,288 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#0A0A0A"
     android:fitsSystemWindows="true"
-    android:orientation="vertical"
-    android:padding="12dp"
     tools:context=".MainActivity">
 
-    <!-- Warnings (location off, approximate only, battery optimisation, …) -->
+    <!-- Map: metro line, stations, every position marker and events -->
+    <org.osmdroid.views.MapView
+        android:id="@+id/map"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Top: warning (when something needs fixing) and the status -->
     <LinearLayout
-        android:id="@+id/warningBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="8dp"
-        android:background="#3E2723"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
-        android:padding="8dp"
-        android:visibility="gone">
+        android:layout_gravity="top"
+        android:layout_margin="8dp"
+        android:orientation="vertical">
 
-        <TextView
-            android:id="@+id/warningText"
-            android:layout_width="0dp"
+        <LinearLayout
+            android:id="@+id/warningBar"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:textColor="#FFCCBC"
-            android:textSize="12sp"
-            tools:text="Location is turned off" />
+            android:layout_marginBottom="6dp"
+            android:background="@drawable/panel_bg"
+            android:backgroundTint="#3E2723"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="10dp"
+            android:paddingEnd="4dp"
+            android:visibility="gone">
 
-        <Button
-            android:id="@+id/btnFixWarning"
-            style="?android:attr/buttonBarButtonStyle"
+            <TextView
+                android:id="@+id/warningText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textColor="#FFCCBC"
+                android:textSize="12sp"
+                tools:text="Location is turned off" />
+
+            <Button
+                android:id="@+id/btnFixWarning"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/fix"
+                android:textColor="#FFAB91" />
+        </LinearLayout>
+
+        <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/fix"
-            android:textColor="#FFAB91" />
+            android:background="@drawable/panel_bg"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="6dp">
+
+            <TextView
+                android:id="@+id/statusIndicator"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/status_waiting"
+                android:textAllCaps="true"
+                android:textColor="#9E9E9E"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/networkText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:textColor="#9E9E9E"
+                android:textSize="11sp"
+                tools:text="Network: Lost" />
+        </LinearLayout>
+
+        <!-- Required by OpenStreetMap's licence: visible attribution with a link -->
+        <TextView
+            android:id="@+id/mapAttribution"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end"
+            android:layout_marginTop="4dp"
+            android:background="@drawable/panel_bg"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="3dp"
+            android:text="@string/osm_attribution"
+            android:textColor="#BDBDBD"
+            android:textSize="11sp" />
     </LinearLayout>
 
-    <!-- Status -->
-    <androidx.cardview.widget.CardView
+    <!-- Map buttons -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end|center_vertical"
+        android:layout_marginEnd="8dp"
+        android:orientation="vertical">
+
+        <ImageButton
+            android:id="@+id/btnRecenter"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:background="@drawable/round_button_bg"
+            android:contentDescription="@string/recenter"
+            android:src="@drawable/ic_my_location" />
+
+        <ImageButton
+            android:id="@+id/btnMenu"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:layout_marginTop="8dp"
+            android:background="@drawable/round_button_bg"
+            android:contentDescription="@string/more_options"
+            android:src="@drawable/ic_more_vert" />
+    </LinearLayout>
+
+    <!-- Bottom: compact navigation panel (tap for details) -->
+    <LinearLayout
+        android:id="@+id/panel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        app:cardBackgroundColor="#1A1A1A"
-        app:cardCornerRadius="12dp">
+        android:layout_gravity="bottom"
+        android:layout_margin="8dp"
+        android:background="@drawable/panel_bg"
+        android:orientation="vertical"
+        android:paddingHorizontal="12dp"
+        android:paddingTop="10dp"
+        android:paddingBottom="2dp">
+
+        <!-- Test drive (no metro needed): shown while recording a route or testing on one -->
+        <LinearLayout
+            android:id="@+id/testDriveBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="4dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:visibility="gone"
+            tools:visibility="visible">
+
+            <TextView
+                android:id="@+id/testDriveText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textColor="#FFD54F"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                tools:text="TUNNEL TEST · GPS hidden · error 23 m (avg 18, max 64)" />
+
+            <Button
+                android:id="@+id/btnTestDrivePrimary"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:textColor="#00E5FF"
+                android:textSize="12sp"
+                tools:text="@string/end_tunnel" />
+
+            <Button
+                android:id="@+id/btnTestDriveSecondary"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:textColor="#FF8A80"
+                android:textSize="12sp"
+                tools:text="@string/end_test" />
+        </LinearLayout>
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:padding="12dp">
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-            <LinearLayout
-                android:layout_width="match_parent"
+            <TextView
+                android:id="@+id/lineText"
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal">
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="@string/searching_line"
+                android:textColor="#90CAF9"
+                android:textSize="12sp"
+                android:textStyle="bold" />
 
-                <TextView
-                    android:id="@+id/statusIndicator"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/status_waiting"
-                    android:textAllCaps="true"
-                    android:textColor="#9E9E9E"
-                    android:textSize="12sp"
-                    android:textStyle="bold" />
+            <TextView
+                android:id="@+id/confidenceVal"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                tools:text="±60 m" />
+        </LinearLayout>
 
-                <TextView
-                    android:id="@+id/networkText"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:textColor="#9E9E9E"
-                    android:textSize="12sp"
-                    tools:text="Network: Lost" />
-            </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:baselineAligned="false"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/currentStationText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="@string/dash"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/nextStationText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:gravity="end"
+                android:maxLines="1"
+                android:text="@string/dash"
+                android:textColor="#03A9F4"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/distToNextText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#81C784"
+            android:textSize="13sp"
+            tools:text="Next stop in 640 m · ~1 min" />
+
+        <TextView
+            android:id="@+id/metricsText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#BDBDBD"
+            android:textSize="12sp"
+            tools:text="42 km/h · 87° · 1240 m without GPS" />
+
+        <TextView
+            android:id="@+id/destinationText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#FFB74D"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:visibility="gone"
+            tools:text="Towards: Majestic · 4 stops"
+            tools:visibility="visible" />
+
+        <!-- Details: hidden until the panel is tapped -->
+        <LinearLayout
+            android:id="@+id/details"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="vertical"
+            android:visibility="gone"
+            tools:visibility="visible">
 
             <TextView
                 android:id="@+id/locationText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
                 android:fontFamily="monospace"
                 android:text="@string/no_position"
                 android:textColor="#FFFFFF"
-                android:textSize="22sp"
+                android:textSize="15sp"
                 android:textStyle="bold" />
 
             <TextView
@@ -94,241 +290,70 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:textColor="#BDBDBD"
-                android:textSize="12sp"
-                tools:text="Underground · track navigation · confidence MEDIUM" />
-        </LinearLayout>
-    </androidx.cardview.widget.CardView>
-
-    <!-- Metro navigation -->
-    <androidx.cardview.widget.CardView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        app:cardBackgroundColor="#121212"
-        app:cardCornerRadius="8dp">
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:padding="10dp">
+                android:textSize="11sp"
+                tools:text="No GPS · track navigation · satellites 0/12" />
 
             <TextView
-                android:id="@+id/lineText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/searching_line"
-                android:textColor="#90CAF9"
-                android:textSize="12sp"
-                android:textStyle="bold" />
-
-            <LinearLayout
+                android:id="@+id/legendText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:baselineAligned="false"
-                android:orientation="horizontal">
-
-                <TextView
-                    android:id="@+id/currentStationText"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/dash"
-                    android:textColor="#FFFFFF"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/nextStationText"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:gravity="end"
-                    android:text="@string/dash"
-                    android:textColor="#03A9F4"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-
-            <TextView
-                android:id="@+id/distToNextText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:gravity="center_horizontal"
-                android:textColor="#81C784"
-                android:textSize="13sp"
-                tools:text="Next stop in 640 m · ~1 min" />
-
-            <TextView
-                android:id="@+id/destinationText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:gravity="center_horizontal"
-                android:textColor="#FFB74D"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                tools:text="Towards: Majestic · 4 stops" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <Spinner
-                    android:id="@+id/destinationSpinner"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:backgroundTint="#BDBDBD"
-                    android:popupBackground="#212121" />
-
-                <Button
-                    android:id="@+id/btnFlipDirection"
-                    style="?android:attr/buttonBarButtonStyle"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/flip_direction"
-                    android:textColor="#FFB74D"
-                    android:textSize="12sp" />
-            </LinearLayout>
+                android:textColor="#BDBDBD"
+                android:textSize="11sp"
+                tools:text="● GPS  ● Track  ● Network  ● Wi-Fi  ● Dead reckoning  ◆ Event" />
 
             <TextView
                 android:id="@+id/offlineText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
                 android:textColor="#9E9E9E"
                 android:textSize="11sp"
                 tools:text="Metro line data: saved on phone (6 lines) — works offline" />
-
-            <LinearLayout
-                style="?android:attr/buttonBarStyle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/btnRefreshLines"
-                    style="?android:attr/buttonBarButtonStyle"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/refresh_lines"
-                    android:textColor="#90CAF9"
-                    android:textSize="12sp" />
-
-                <Button
-                    android:id="@+id/btnDownloadCity"
-                    style="?android:attr/buttonBarButtonStyle"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/download_city"
-                    android:textColor="#90CAF9"
-                    android:textSize="12sp" />
-            </LinearLayout>
-        </LinearLayout>
-    </androidx.cardview.widget.CardView>
-
-    <!-- Metrics -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:baselineAligned="false"
-        android:orientation="horizontal">
-
-        <LinearLayout style="@style/Metric">
-            <TextView style="@style/MetricLabel" android:text="@string/label_speed" />
-            <TextView android:id="@+id/speedVal" style="@style/MetricValue" android:textColor="#00E5FF" tools:text="42 km/h" />
-        </LinearLayout>
-
-        <LinearLayout style="@style/Metric">
-            <TextView style="@style/MetricLabel" android:text="@string/label_heading" />
-            <TextView android:id="@+id/headingVal" style="@style/MetricValue" android:textColor="#FFD600" tools:text="87°" />
-        </LinearLayout>
-
-        <LinearLayout style="@style/Metric">
-            <TextView style="@style/MetricLabel" android:text="@string/label_no_gps" />
-            <TextView android:id="@+id/distanceVal" style="@style/MetricValue" android:textColor="#00C853" tools:text="1240 m" />
-        </LinearLayout>
-
-        <LinearLayout style="@style/Metric">
-            <TextView style="@style/MetricLabel" android:text="@string/label_confidence" />
-            <TextView android:id="@+id/confidenceVal" style="@style/MetricValue" android:textColor="#FFFFFF" tools:text="±60 m" />
-        </LinearLayout>
-    </LinearLayout>
-
-    <!-- Logging -->
-    <androidx.cardview.widget.CardView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        app:cardBackgroundColor="#1A1A1A"
-        app:cardCornerRadius="8dp">
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:padding="8dp">
 
             <TextView
                 android:id="@+id/tvLogFilePath"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginBottom="6dp"
                 android:fontFamily="monospace"
-                android:gravity="center"
                 android:textColor="#00E5FF"
                 android:textSize="11sp"
-                tools:text="Log: Download/TestGPSLocation/Metro_Navigator_telemetry_log.txt" />
-
-            <LinearLayout
-                style="?android:attr/buttonBarStyle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/btnStartLogging"
-                    style="?android:attr/buttonBarButtonStyle"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/start_logging"
-                    android:textColor="@color/button_text" />
-
-                <Button
-                    android:id="@+id/btnStopLogging"
-                    style="?android:attr/buttonBarButtonStyle"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/stop_logging"
-                    android:textColor="@color/button_text" />
-            </LinearLayout>
+                tools:text="Log: Download/TestGPSLocation/Metro_Navigator_telemetry_2026-11-02.txt" />
         </LinearLayout>
-    </androidx.cardview.widget.CardView>
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="@string/history_title"
-        android:textAllCaps="true"
-        android:textColor="#757575"
-        android:textSize="11sp"
-        android:textStyle="bold" />
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/historyList"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:background="#050505" />
-</LinearLayout>
+            <Spinner
+                android:id="@+id/destinationSpinner"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:backgroundTint="#BDBDBD"
+                android:popupBackground="#212121" />
+
+            <Button
+                android:id="@+id/btnFlipDirection"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:text="@string/flip_direction"
+                android:textColor="#FFB74D"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnLogging"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:text="@string/start_logging"
+                android:textColor="#00E5FF"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>

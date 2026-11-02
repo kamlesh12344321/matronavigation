@@ -1,17 +1,10 @@
 package com.example.testgpslocation.utils
 
-import com.example.testgpslocation.models.GpsPoint
 import kotlin.math.*
 
 object GeoToolbox {
 
     private const val EARTH_RADIUS_METER = 6371000.0
-
-    @JvmStatic
-    fun calculateDistance(start: GpsPoint?, end: GpsPoint?): Double {
-        if (start == null || end == null) return 0.0
-        return calculateDistance(start.latitude, start.longitude, end.latitude, end.longitude)
-    }
 
     @JvmStatic
     fun calculateDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {

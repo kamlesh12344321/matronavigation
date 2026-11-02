@@ -44,7 +44,7 @@ class MainActivity : AppCompatActivity() {
         val layout = LinearLayoutManager(this)
         list.layoutManager = layout
         list.adapter = adapter
-        findViewById<TextView>(R.id.tvLogFilePath).text = "File: ${TelemetryLogger.getLogLocation(this)}"
+        val tvLogFile = findViewById<TextView>(R.id.tvLogFilePath)
 
         btnStart.setOnClickListener {
             if (hasLocationPermission()) {
@@ -75,6 +75,8 @@ class MainActivity : AppCompatActivity() {
                         tvStatus.text = (if (logging) "Logging" else "Stopped") + " · $count points"
                         btnStart.isEnabled = !logging
                         btnStop.isEnabled = logging
+                        tvLogFile.text = TelemetryLogger.currentFileName?.let { getString(R.string.file_current, TelemetryLogger.FOLDER_DESCRIPTION, it) }
+                            ?: getString(R.string.file_new_each_start, TelemetryLogger.FOLDER_DESCRIPTION)
                     }
                 }
             }

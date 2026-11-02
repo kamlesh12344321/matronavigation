@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.zip.GZIPInputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -25,7 +26,12 @@ sealed class DownloadResult {
 }
 
 /**
- * Metro line data from OpenStreetMap (Overpass API), stored on the phone for offline use.
+ * Metro line data, stored on the phone for offline use. Sources, in order:
+ *  1. lines bundled inside the APK (assets/metro/<city>.json.gz, made at build time by
+ *     scripts/build_metro_bundle.py): available on first launch with no network at all;
+ *  2. lines downloaded earlier (phone cache);
+ *  3. a live Overpass (OpenStreetMap) download — only an optional refresh / new-city path,
+ *     never required: navigation works with 1 or 2 alone, and without any line at all.
  *
  * Offline lookups ([cachedNear]) never touch the network and never wait for a download, so a
  * slow or stalled download on a weak network cannot delay navigation underground.
@@ -42,7 +48,57 @@ class MetroRouteService(context: Context) {
     private data class Area(val lat: Double, val lon: Double, val radius: Int, val time: Long)
 
     /** Loads the offline cache; returns the number of saved lines. */
-    suspend fun preload(): Int = withContext(Dispatchers.IO) { cacheMutex.withLock { loadCache().size } }
+    suspend fun preload(): Int = withContext(Dispatchers.IO) {
+        cacheMutex.withLock {
+            val routes = loadCache()
+            importBundledLocked(routes)
+            routes.size
+        }
+    }
+
+    /**
+     * Copies the lines shipped in the APK into the cache, once per app install / update.
+     * Lines already on the phone (e.g. a newer download) are kept.
+     */
+    private fun importBundledLocked(routes: MutableList<MetroRoute>) {
+        val names = try { appContext.assets.list(BUNDLE_DIR)?.filter { it.endsWith(".json.gz") } } catch (e: Exception) { null }
+        if (names.isNullOrEmpty()) return
+        val stamp = try {
+            appContext.packageManager.getPackageInfo(appContext.packageName, 0).lastUpdateTime.toString()
+        } catch (e: Exception) { "0" }
+        val marker = File(cacheDir, BUNDLE_MARKER)
+        val done = try { if (marker.exists()) marker.readLines().toMutableSet() else mutableSetOf() } catch (e: Exception) { mutableSetOf() }
+        var changed = false
+        for (name in names) {
+            val key = "$name@$stamp"
+            if (key in done) continue
+            try {
+                val json = GZIPInputStream(appContext.assets.open("$BUNDLE_DIR/$name")).bufferedReader().use { it.readText() }
+                val lines = OverpassParser.parseAll(json)
+                lines.forEach { route ->
+                    if (routes.none { it.id == route.id }) { routes.add(route); save(route) }
+                }
+                JSONObject(json).optJSONObject("bundle")?.let { b ->
+                    val lat = b.optDouble("lat"); val lon = b.optDouble("lon")
+                    if (!lat.isNaN() && !lon.isNaN()) markAreaDownloaded(lat, lon, b.optInt("radius", CITY_RADIUS_METERS))
+                }
+                Log.i(TAG, "Imported ${lines.size} bundled lines from $name")
+            } catch (e: Exception) {
+                Log.e(TAG, "Bundled line file $name is unreadable", e) // keep going: other cities / cache still work
+            }
+            done.removeAll { it.startsWith("$name@") }
+            done.add(key)
+            changed = true
+        }
+        if (changed) {
+            try {
+                if (!cacheDir.exists()) cacheDir.mkdirs()
+                marker.writeText(done.joinToString("\n"))
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not record bundled import", e)
+            }
+        }
+    }
 
     /** Saved lines within [maxOffsetMeters] of the location, nearest first. Offline only. */
     suspend fun cachedNear(lat: Double, lon: Double, maxOffsetMeters: Double = MAX_ROUTE_DISTANCE_METERS): List<MetroRoute> =
@@ -87,7 +143,7 @@ class MetroRouteService(context: Context) {
                 if (json == null) return@withLock DownloadResult.Failed(lastError)
 
                 val fetched = try {
-                    parseAll(json)
+                    OverpassParser.parseAll(json)
                 } catch (e: Exception) {
                     Log.e(TAG, "Parse failed", e)
                     return@withLock DownloadResult.Failed("bad data from server (${e.javaClass.simpleName})")
@@ -156,94 +212,6 @@ class MetroRouteService(context: Context) {
         }
     }
 
-    /** Builds one route per metro relation; falls back to stitched loose ways if there are none. */
-    private fun parseAll(json: String): List<MetroRoute> {
-        val elements = JSONObject(json).optJSONArray("elements") ?: return emptyList()
-        val nodes = mutableMapOf<Long, JSONObject>()
-        val ways = mutableMapOf<Long, JSONObject>()
-        val relations = mutableListOf<JSONObject>()
-        for (i in 0 until elements.length()) {
-            val el = elements.optJSONObject(i) ?: continue
-            when (el.optString("type")) {
-                "node" -> nodes[el.optLong("id")] = el
-                "way" -> ways[el.optLong("id")] = el
-                "relation" -> relations.add(el)
-            }
-        }
-        val allStations = nodes.values.filter { isStation(it.optJSONObject("tags")) }.mapNotNull { toStation(it) }
-
-        val routes = relations.filter { isMetro(it.optJSONObject("tags")) }.mapNotNull { rel ->
-            val members = rel.optJSONArray("members") ?: return@mapNotNull null
-            val trackWays = mutableListOf<List<TrackPoint>>()
-            val stops = mutableListOf<MetroStation>()
-            for (i in 0 until members.length()) {
-                val m = members.optJSONObject(i) ?: continue
-                val role = m.optString("role", "")
-                val ref = m.optLong("ref")
-                when (m.optString("type")) {
-                    "way" -> if (!role.startsWith("platform")) {
-                        val pts = if (m.has("geometry")) geometry(m) else ways[ref]?.let { geometry(it) } ?: emptyList()
-                        if (pts.size >= 2) trackWays.add(pts)
-                    }
-                    "node" -> nodes[ref]?.let { n ->
-                        if (role.startsWith("stop") || isStation(n.optJSONObject("tags"))) toStation(n)?.let(stops::add)
-                    }
-                }
-            }
-            val tags = rel.optJSONObject("tags")
-            MetroRoute(
-                id = "rel_${rel.optLong("id")}",
-                lineName = lineName(tags),
-                fromStation = tags?.optStringOrNull("from"),
-                toStation = tags?.optStringOrNull("to"),
-                points = TrackStitcher.stitch(trackWays),
-                rawStations = stops.ifEmpty { allStations }
-            ).takeIf { it.isValid }
-        }
-        if (routes.isNotEmpty()) return routes
-
-        // No route relations: stitch the loose subway ways into one line.
-        val metroWays = ways.values.filter { isMetro(it.optJSONObject("tags")) }
-        if (metroWays.isEmpty()) return emptyList()
-        val track = TrackStitcher.stitch(metroWays.map { geometry(it) })
-        val tags = metroWays.first().optJSONObject("tags")
-        return listOfNotNull(MetroRoute("way_${metroWays.first().optLong("id")}", lineName(tags), null, null, track, allStations).takeIf { it.isValid })
-    }
-
-    private fun geometry(obj: JSONObject): List<TrackPoint> {
-        val geom = obj.optJSONArray("geometry") ?: return emptyList()
-        return (0 until geom.length()).mapNotNull { i ->
-            val p = geom.optJSONObject(i) ?: return@mapNotNull null // null entries appear for clipped geometry
-            TrackPoint(p.optDouble("lat"), p.optDouble("lon")).takeIf { !it.lat.isNaN() && !it.lon.isNaN() }
-        }
-    }
-
-    private fun toStation(node: JSONObject): MetroStation? {
-        val tags = node.optJSONObject("tags")
-        val name = tags?.optStringOrNull("name:en") ?: tags?.optStringOrNull("name") ?: return null
-        val lat = node.optDouble("lat"); val lon = node.optDouble("lon")
-        if (lat.isNaN() || lon.isNaN()) return null
-        return MetroStation(name, lat, lon)
-    }
-
-    private fun lineName(tags: JSONObject?): String =
-        tags?.optStringOrNull("name:en") ?: tags?.optStringOrNull("name") ?: tags?.optStringOrNull("ref")?.let { "Line $it" } ?: "Metro line"
-
-    private fun isMetro(tags: JSONObject?): Boolean {
-        if (tags == null) return false
-        val kinds = setOf("subway", "light_rail", "monorail")
-        return tags.optString("route") in kinds || tags.optString("railway") in kinds
-    }
-
-    private fun isStation(tags: JSONObject?): Boolean {
-        if (tags == null) return false
-        val rw = tags.optString("railway")
-        return rw == "station" || rw == "halt" || rw == "stop" || tags.optString("public_transport") == "stop_position"
-    }
-
-    private fun JSONObject.optStringOrNull(key: String): String? =
-        if (has(key) && !isNull(key)) optString(key).trim().takeIf { it.isNotEmpty() } else null
-
     // ---- Offline storage (call with cacheMutex held) -------------------------------------------
 
     private fun loadCache(): MutableList<MetroRoute> {
@@ -266,36 +234,16 @@ class MetroRouteService(context: Context) {
     private fun save(route: MetroRoute) {
         try {
             if (!cacheDir.exists()) cacheDir.mkdirs()
-            val root = JSONObject().apply {
-                put("version", CACHE_VERSION)
-                put("id", route.id)
-                put("lineName", route.lineName)
-                route.fromStation?.let { put("from", it) }
-                route.toStation?.let { put("to", it) }
-                put("track", JSONArray().apply { route.points.forEach { put(JSONArray().put(it.lat).put(it.lon)) } })
-                put("stations", JSONArray().apply {
-                    route.stations.forEach { s -> put(JSONObject().put("name", s.name).put("lat", s.lat).put("lon", s.lon)) }
-                })
-            }
             // Write to a temp file then rename, so a crash / full disk never leaves a half-written line.
             val tmp = File(cacheDir, "${route.id}.json.tmp")
-            tmp.writeText(root.toString())
+            tmp.writeText(RouteJson.write(route))
             if (!tmp.renameTo(File(cacheDir, "${route.id}.json"))) tmp.delete()
         } catch (e: Exception) {
             Log.e(TAG, "Cache save failed", e)
         }
     }
 
-    private fun read(file: File): MetroRoute? {
-        val root = JSONObject(file.readText())
-        if (root.optInt("version") != CACHE_VERSION) return null
-        val track = root.getJSONArray("track").let { a -> (0 until a.length()).map { a.getJSONArray(it).let { p -> TrackPoint(p.getDouble(0), p.getDouble(1)) } } }
-        val stations = root.getJSONArray("stations").let { a ->
-            (0 until a.length()).map { a.getJSONObject(it).let { o -> MetroStation(o.getString("name"), o.getDouble("lat"), o.getDouble("lon")) } }
-        }
-        return MetroRoute(root.getString("id"), root.getString("lineName"), root.optStringOrNull("from"), root.optStringOrNull("to"), track, stations)
-            .takeIf { it.isValid }
-    }
+    private fun read(file: File): MetroRoute? = RouteJson.read(file.readText())
 
     private fun markAreaDownloaded(lat: Double, lon: Double, radius: Int) {
         val cutoff = System.currentTimeMillis() - AREA_MAX_AGE_MS
@@ -329,15 +277,17 @@ class MetroRouteService(context: Context) {
 
     companion object {
         private const val TAG = "MetroRouteService"
-        private const val USER_AGENT = "TestGPSLocation-MetroNavigator/1.0"
+        /** This app's identity for every OpenStreetMap service (line data and map tiles). */
+        const val USER_AGENT = "TestGPSLocation-MetroNavigator/1.0"
         private val OVERPASS_URLS = listOf(
             "https://overpass-api.de/api/interpreter",
             "https://overpass.kumi.systems/api/interpreter",
             "https://overpass.private.coffee/api/interpreter"
         )
         private const val CACHE_DIR = "metro_routes"
-        private const val CACHE_VERSION = 2
         private const val AREAS_FILE = "downloaded_areas.json"
+        private const val BUNDLE_DIR = "metro"
+        private const val BUNDLE_MARKER = "bundled_imported.txt"
         private const val AREA_MAX_AGE_MS = 7L * 24 * 3600 * 1000
         private const val AREA_EDGE_MARGIN_METERS = 500
         private const val CONNECT_TIMEOUT_MS = 10_000

@@ -6,4 +6,6 @@
     <string name="no_fix">No fix yet</string>
     <string name="location_off">Location is turned off — tap here to turn it on</string>
     <string name="permission_needed">Location permission is required</string>
+    <string name="file_current">File: %1$s/%2$s</string>
+    <string name="file_new_each_start">File: a new file in %1$s each time logging starts</string>
 </resources>

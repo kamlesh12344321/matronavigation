@@ -31,7 +31,7 @@ class UndergroundNavigatorTest {
 
     private fun fix(lat: Double, speed: Float = 10f, bearing: Float = 0f) {
         clock += 1000
-        nav.onGpsFix(GpsPoint(lat, 77.0, 5f, clock, speed, bearing, hasSpeed = true, hasBearing = speed > 0f, elapsedRealtimeMs = clock), clock)
+        nav.onLocationFix(GpsPoint(lat, 77.0, 5f, clock, speed, bearing, hasSpeed = true, hasBearing = speed > 0f, elapsedRealtimeMs = clock), clock)
     }
 
     private fun run(state: MotionState, seconds: Double, accelNorth: Double = 0.0) {
@@ -105,11 +105,24 @@ class UndergroundNavigatorTest {
     }
 
     @Test
-    fun walkingDoesNotMoveTheTrain() {
+    fun walkingOnThePlatformDoesNotMoveTheTrain() {
         enterTunnelMovingNorth()
+        run(MotionState.MOVING, 90.0)
+        run(MotionState.STATIONARY, 10.0) // stopped at a station
         val before = nav.state().latitude
         run(MotionState.WALKING, 60.0)
         assertEquals(before, nav.state().latitude, 1e-9)
+    }
+
+    @Test
+    fun walkingInsideAMovingTrainKeepsItGoing() {
+        enterTunnelMovingNorth()
+        val before = nav.state().latitude
+        val speed = nav.state().speedMps
+        run(MotionState.WALKING, 10.0)
+        val moved = (nav.state().latitude - before) * 111_195.0
+        assertEquals("kept its speed", speed, nav.state().speedMps, 1e-9)
+        assertTrue("moved $moved m", moved > 0.8 * speed * 10.0)
     }
 
     @Test
@@ -155,7 +168,7 @@ class UndergroundNavigatorTest {
         run(MotionState.MOVING, 30.0)
         val estimate = nav.state().latitude
         clock += 1000
-        nav.onGpsFix(GpsPoint(estimate + 0.0005, 77.0, 5f, clock, 10f, 0f, hasSpeed = true, hasBearing = true, elapsedRealtimeMs = clock), clock)
+        nav.onLocationFix(GpsPoint(estimate + 0.0005, 77.0, 5f, clock, 10f, 0f, hasSpeed = true, hasBearing = true, elapsedRealtimeMs = clock), clock)
         val s = nav.state()
         assertTrue(s.gpsAvailable)
         assertNotNull(s.lastRecoveryDriftMeters)

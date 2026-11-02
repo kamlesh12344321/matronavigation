@@ -117,6 +117,37 @@ class MetroRoute(
     fun nearestStation(distance: Double): MetroStation? =
         stations.minByOrNull { kotlin.math.abs(it.distanceAlongTrack - distance) }
 
+    /**
+     * Signed change of travel heading (degrees, clockwise positive) when riding from distance
+     * [from] to distance [to], in either direction. Curves of the line, used to match the turn
+     * the phone's gyroscope measures.
+     */
+    fun turnBetween(from: Double, to: Double): Double =
+        cumulativeTurn[segmentIndex(to.coerceIn(0.0, length)).coerceAtMost(points.size - 2).coerceAtLeast(0)] -
+            cumulativeTurn[segmentIndex(from.coerceIn(0.0, length)).coerceAtMost(points.size - 2).coerceAtLeast(0)]
+
+    /** Heading of segment i relative to segment 0, unwrapped; mapping noise (tiny or folded segments) ignored. */
+    private val cumulativeTurn: DoubleArray by lazy {
+        val out = DoubleArray(kotlin.math.max(1, this.points.size - 1))
+        var prevBearing: Double? = null
+        var acc = 0.0
+        for (i in 0 until this.points.size - 1) {
+            val a = this.points[i]; val b = this.points[i + 1]
+            if (GeoToolbox.calculateDistance(a.lat, a.lon, b.lat, b.lon) >= MIN_TURN_SEGMENT_METERS) {
+                val bearing = GeoToolbox.calculateBearing(a.lat, a.lon, b.lat, b.lon)
+                prevBearing?.let { pb ->
+                    var d = bearing - pb
+                    if (d > 180) d -= 360
+                    if (d < -180) d += 360
+                    if (kotlin.math.abs(d) <= MAX_VERTEX_TURN_DEG) acc += d
+                }
+                prevBearing = bearing
+            }
+            out[i] = acc
+        }
+        out
+    }
+
     private fun segmentIndex(distance: Double): Int {
         var lo = 0; var hi = points.size - 1
         while (lo < hi) {
@@ -130,6 +161,9 @@ class MetroRoute(
         const val MAX_STATION_OFFSET_METERS = 400.0
         const val MIN_STATION_SPACING_METERS = 60.0
         const val ON_STATION_TOLERANCE_METERS = 3.0
+        private const val MIN_TURN_SEGMENT_METERS = 2.0
+        /** A sharper bend between two mapped segments is a mapping artefact, not a track curve. */
+        private const val MAX_VERTEX_TURN_DEG = 100.0
     }
 }
 

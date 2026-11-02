@@ -35,7 +35,5 @@ object NetworkStatus {
         NetworkQuality.NONE
     }
 
-    fun isConnected(context: Context) = quality(context) != NetworkQuality.NONE
-
     fun label(context: Context) = quality(context).label
 }

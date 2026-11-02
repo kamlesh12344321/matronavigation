@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@+id/menuTestDrive" android:title="@string/test_drive" />
+    <item android:id="@+id/menuDetails" android:title="@string/show_details" />
+    <item android:id="@+id/menuClearMap" android:title="@string/clear_map" />
+    <item android:id="@+id/menuRefreshLines" android:title="@string/refresh_lines" />
+    <item android:id="@+id/menuDownloadCity" android:title="@string/download_city" />
+</menu>

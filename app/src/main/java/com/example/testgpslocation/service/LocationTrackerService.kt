@@ -62,6 +62,7 @@ class LocationTrackerService : Service() {
             ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MetroNavigator:navigation")
             ?.apply { setReferenceCounted(false); acquire(MAX_WAKE_LOCK_MS) }
         started = true
+        TelemetryLogger.startSession(this) // every start of logging gets its own file
         isRunning.value = true
         TelemetryLogger.logCustom(this, "Logging started")
 
@@ -73,7 +74,12 @@ class LocationTrackerService : Service() {
                     append(" | Satellites used: ").append(p.satellitesUsed)
                     p.lineName?.let { append(" | Line: ").append(it) }
                     p.nextStation?.let { append(" | Next: ").append(it) }
+                    if (p.errorMeters != null && p.truthLatitude != null && p.truthLongitude != null) {
+                        append(String.format(java.util.Locale.US, " | TUNNEL TEST real GPS: %.6f, %.6f | Error: %.0f m",
+                            p.truthLatitude, p.truthLongitude, p.errorMeters))
+                    }
                     if (p.mock) append(" | MOCK LOCATION")
+                    p.sensors?.let { append(" | ").append(it) }
                 }
                 TelemetryLogger.log(
                     this@LocationTrackerService, p.timestamp, p.latitude, p.longitude, p.source.label,
@@ -136,6 +142,7 @@ class LocationTrackerService : Service() {
         if (started) {
             NavigationController.release(CLIENT)
             TelemetryLogger.logCustom(this, "Logging stopped")
+            TelemetryLogger.endSession()
         }
         isRunning.value = false
         super.onDestroy()

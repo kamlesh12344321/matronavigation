@@ -21,6 +21,7 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.testgpslocation.engine.MotionSample
 import com.example.testgpslocation.engine.MotionState
+import com.example.testgpslocation.engine.Pdr
 import com.example.testgpslocation.models.GpsPoint
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
@@ -122,6 +123,11 @@ class SensorHub(context: Context) : SensorEventListener {
     private val gyroMagnitudes = RingBuffer(ROLLING_SAMPLES)
     private val stepTimes = ArrayDeque<Long>()
     private var stillSinceMs = 0L
+    private var stepsInWindow = 0
+    // Turn rate about the vertical (gravity) axis: magnetometer independent
+    private var yawSum = 0.0
+    private var yawCount = 0
+    private var stepDetectorActive = false
 
     // Pressure: rapid change over a few seconds (stairs / escalator into a station)
     private val pressureHistory = ArrayDeque<Pair<Long, Float>>()
@@ -214,9 +220,8 @@ class SensorHub(context: Context) : SensorEventListener {
         rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         gyroscope?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         pressure?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler) }
-        if (stepDetector != null && hasActivityPermission()) {
-            sensorManager.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_NORMAL, handler)
-        }
+        stepDetectorActive = stepDetector != null && hasActivityPermission() &&
+            sensorManager.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_FASTEST, handler)
         handler.postDelayed(gpsWatchdog, 1000L)
         isRunning = true
         return true
@@ -244,6 +249,8 @@ class SensorHub(context: Context) : SensorEventListener {
         isRunning = false
         windowStartMs = 0L
         stillSinceMs = 0L
+        stepsInWindow = 0
+        stepDetectorActive = false
     }
 
     fun isLocationEnabled(): Boolean = try {
@@ -301,9 +308,17 @@ class SensorHub(context: Context) : SensorEventListener {
             Sensor.TYPE_GYROSCOPE -> {
                 val x = event.values[0]; val y = event.values[1]; val z = event.values[2]
                 gyroMagnitudes.add(sqrt((x * x + y * y + z * z).toDouble()))
+                if (hasRotation) {
+                    // Rotation about world "up" (row 3 of device→world), counter-clockwise positive.
+                    yawSum += rotation[6] * x + rotation[7] * y + rotation[8] * z
+                    yawCount++
+                }
             }
             Sensor.TYPE_PRESSURE -> onPressure(event.values[0])
-            Sensor.TYPE_STEP_DETECTOR -> stepTimes.addLast(SystemClock.elapsedRealtime())
+            Sensor.TYPE_STEP_DETECTOR -> {
+                stepTimes.addLast(SystemClock.elapsedRealtime())
+                stepsInWindow++
+            }
         }
     }
 
@@ -323,16 +338,25 @@ class SensorHub(context: Context) : SensorEventListener {
         val elapsed = now - windowStartMs
         if (elapsed < SAMPLE_PERIOD_MS) return
 
+        val state = classify(now)
         val sample = MotionSample(
             elapsedMs = now,
             dtSec = (elapsed / 1000.0).coerceAtMost(1.0), // after a pause (Doze) do not integrate a huge step
-            state = classify(now),
+            state = state,
             stationaryForMs = if (stillSinceMs == 0L) 0L else now - stillSinceMs,
             accelEast = if (windowCount > 0) sumEast / windowCount else 0.0,
             accelNorth = if (windowCount > 0) sumNorth / windowCount else 0.0,
-            pressureRapidChange = pressureRapidChange
+            pressureRapidChange = pressureRapidChange,
+            steps = if (stepDetectorActive) stepsInWindow else null,
+            stepCadenceHz = cadenceHz(),
+            deviceHeadingDeg = if (hasRotation) Pdr.headingFromRotation(rotation) ?: Double.NaN else Double.NaN,
+            orientationKnown = hasRotation,
+            // Bearing rate: clockwise positive, degrees per second.
+            yawRateDps = if (yawCount > 0) -Math.toDegrees(yawSum / yawCount) else Double.NaN,
+            vibration = accelMagnitudes.std() ?: Double.NaN
         )
-        windowStartMs = now; sumEast = 0.0; sumNorth = 0.0; windowCount = 0
+        windowStartMs = now; sumEast = 0.0; sumNorth = 0.0; windowCount = 0; stepsInWindow = 0
+        yawSum = 0.0; yawCount = 0
         listener?.onMotionSample(sample)
     }
 
@@ -350,6 +374,13 @@ class SensorHub(context: Context) : SensorEventListener {
             still && now - stillSinceMs >= STILL_CONFIRM_MS -> MotionState.STATIONARY
             else -> MotionState.MOVING
         }
+    }
+
+    /** Steps per second over the recent step window; 0 when not walking. */
+    private fun cadenceHz(): Double {
+        if (stepTimes.size < 2) return 0.0
+        val span = stepTimes.last() - stepTimes.first()
+        return if (span <= 0) 0.0 else (stepTimes.size - 1) * 1000.0 / span
     }
 
     private fun onPressure(hPa: Float) {

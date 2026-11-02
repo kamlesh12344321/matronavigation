@@ -55,6 +55,73 @@ class EdgeCaseTest {
     }
 
     @Test
+    fun stopsAreSeenWithTheStillnessLearntFromGps() {
+        // With GPS: 10 s standing (idling engine: vibration 0.10, which the fixed rule calls
+        // "moving"), then 10 s driving north at 10 m/s (vibration 0.40). One fix per second.
+        fun second(lat: Double, speed: Float, vibration: Double) {
+            gnss(lat, speed = speed, dtMs = 100)
+            repeat(9) { clock += 100; nav.onMotion(MotionSample(clock, 0.1, MotionState.MOVING, 0, 0.0, 0.0, vibration = vibration)) }
+        }
+        repeat(10) { second(12.90, 0f, 0.10) }
+        repeat(10) { k -> second(12.90 + (k + 1) * 10 / mPerDeg, 10f, 0.40) }
+        assertEquals(0.2, nav.rideMemory.vibration.stillThreshold!!, 0.01)
+
+        fun drive(seconds: Double, vibration: Double) = repeat((seconds * 10).toInt()) {
+            clock += 100; nav.onMotion(MotionSample(clock, 0.1, MotionState.MOVING, 0, 0.0, 0.0, vibration = vibration))
+        }
+        nav.onGpsLost(clock)
+        drive(5.0, 0.40)
+        assertTrue("still driving", nav.state().speedMps > 5.0)
+        // Stopped at a light, engine idling: the fixed rule still says "moving", the learnt one does not.
+        drive(3.0, 0.10)
+        val stopLat = nav.currentLat
+        drive(8.0, 0.10)
+        assertEquals(0.0, nav.state().speedMps, 1e-9)
+        assertEquals(stopLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aPullAwayAfterIdlingIsStillSeenWithoutALine() {
+        // Driving east with GPS, then GPS lost and a stop at a traffic light (no line saved).
+        repeat(5) { k -> gnss(12.90, lon = 77.0 + k * 10 / 108_000.0, speed = 10f, bearing = 90f) }
+        nav.onGpsLost(clock)
+        run(MotionState.STATIONARY, 10.0)
+        val stopLon = nav.currentLon
+        val stopUncertainty = nav.state().uncertaintyMeters
+        // Engine vibration at the light reads as "moving" without any acceleration: no departure yet...
+        run(MotionState.MOVING, 9.0)
+        assertEquals(stopLon, nav.currentLon, 1e-9)
+        // ...but the error grows, since the vehicle might be moving unseen.
+        assertTrue("uncertainty ${nav.state().uncertaintyMeters}", nav.state().uncertaintyMeters > stopUncertainty + 10.0)
+        // Then it really pulls away: still seen after the first window was used up by the idling.
+        run(MotionState.MOVING, 6.0, accelEast = 1.2)
+        run(MotionState.MOVING, 10.0)
+        val movedEast = (nav.currentLon - stopLon) * 108_000.0
+        assertTrue("moved $movedEast m east", movedEast > 20.0)
+    }
+
+    @Test
+    fun everyGpsFixMovesThePositionEvenWithoutSpeed() {
+        // Some phones report no speed with their fixes: each fix must still be the position
+        // (it used to stay frozen until a fix was 15 m away).
+        repeat(6) { i ->
+            val lat = 12.90 + i * 3.0 / mPerDeg
+            clock += 1000
+            nav.onLocationFix(GpsPoint(lat, 77.0, 5f, clock, elapsedRealtimeMs = clock, isGnss = true), clock)
+            assertEquals("fix $i", lat, nav.currentLat, 1e-9)
+        }
+    }
+
+    @Test
+    fun slowGpsMovementIsFollowedFixByFix() {
+        repeat(6) { i ->
+            val lat = 12.90 + i * 2.0 / mPerDeg
+            gnss(lat, speed = 0.3f, bearing = 0f)
+            assertEquals("fix $i", lat, nav.currentLat, 1e-9)
+        }
+    }
+
+    @Test
     fun invalidFixesAreIgnored() {
         clock += 1000
         nav.onLocationFix(GpsPoint(0.0, 0.0, 5f, clock, elapsedRealtimeMs = clock), clock)

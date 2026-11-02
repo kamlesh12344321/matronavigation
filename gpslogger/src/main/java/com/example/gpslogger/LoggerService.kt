@@ -15,6 +15,7 @@ import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.example.testgpslocation.utils.TelemetryLogger
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -55,6 +56,7 @@ class LoggerService : Service() {
                 .build()
             fusedClient.requestLocationUpdates(request, callback, Looper.getMainLooper())
             started = true
+            TelemetryLogger.startSession(this) // every start of logging gets its own file
             LocationLog.isLogging.value = true
         } catch (e: Exception) {
             Log.w(TAG, "Cannot start logging", e)
@@ -86,7 +88,10 @@ class LoggerService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        if (started) fusedClient.removeLocationUpdates(callback)
+        if (started) {
+            fusedClient.removeLocationUpdates(callback)
+            TelemetryLogger.endSession()
+        }
         LocationLog.isLogging.value = false
         super.onDestroy()
     }

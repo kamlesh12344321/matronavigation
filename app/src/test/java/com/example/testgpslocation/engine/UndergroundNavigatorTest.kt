@@ -85,14 +85,17 @@ class UndergroundNavigatorTest {
     }
 
     @Test
-    fun estimateIsHeldAtNextStationUntilTheTrainStops() {
+    fun estimateSlowsAtNextStationButKeepsMovingUntilTheTrainStops() {
         enterTunnelMovingNorth()
         run(MotionState.MOVING, 115.0) // would overshoot B by ~100 m
-        val held = nav.state()
-        assertEquals("B", held.nextStation)
-        assertTrue(held.distanceToNextMeters!! < 10.0)
+        val nearB = nav.state().latitude
+        assertEquals("slowed down at B, not 100 m past it", 12.91, nearB, 25.0 / 111_195.0)
+        // The train has not stopped, so the coordinates must keep changing (no frozen rows).
+        run(MotionState.MOVING, 1.0)
+        assertTrue("still moving", nav.state().latitude > nearB)
         run(MotionState.STATIONARY, 6.0)
         assertEquals("B", nav.state().previousStation)
+        assertEquals(12.91, nav.state().latitude, 1e-4)
     }
 
     @Test

@@ -9,8 +9,6 @@ import android.util.Log
 import com.example.testgpslocation.models.GpsPoint
 import com.example.testgpslocation.sensor.CellScanner
 import com.example.testgpslocation.sensor.DeviceCapabilities
-import com.example.testgpslocation.sensor.RadioCapabilities
-import com.example.testgpslocation.sensor.RadioScanner
 import com.example.testgpslocation.sensor.SensorHub
 import com.example.testgpslocation.utils.GeoToolbox
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -23,12 +21,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToLong
 
 /**
  * A position to log and mark on the map: checked at every GPS fix and every 2 s without GPS,
@@ -77,7 +76,7 @@ data class MapEvent(val timestamp: Long, val latitude: Double, val longitude: Do
  * going in the background while logging. All state changes happen on the main thread.
  */
 @SuppressLint("StaticFieldLeak") // holds the application context only
-object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellScanner.Listener {
+object NavigationController : SensorHub.Listener {
 
     private const val TAG = "NavigationController"
     private const val MAX_TRAIL_POINTS = 10_000 // ~2.8 h of 1 s GPS fixes
@@ -92,13 +91,11 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
     private const val LOOKUP_DISTANCE_METERS = 200.0
     private const val INITIAL_BACKOFF_MS = 30_000L
     private const val MAX_BACKOFF_MS = 10 * 60_000L
-    private const val RADIO_MAP_FILE = "radio_map.txt"
-    private const val RIDE_MEMORY_FILE = "ride_memory.txt"
-    private const val RADIO_SAVE_INTERVAL_MS = 60_000L
+    /** Learnt-data files of earlier versions (fingerprints, run speeds): nothing is learnt any more. */
+    private val OBSOLETE_FILES = listOf("radio_map.txt", "ride_memory.txt", "radio_map.txt.tmp", "ride_memory.txt.tmp")
 
     private lateinit var appContext: Context
     private lateinit var sensorHub: SensorHub
-    private lateinit var radioScanner: RadioScanner
     private lateinit var cellScanner: CellScanner
     private lateinit var routeService: MetroRouteService
     private val navigator = UndergroundNavigator()
@@ -137,14 +134,6 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
 
     val capabilities: DeviceCapabilities? get() = if (::sensorHub.isInitialized) sensorHub.capabilities else null
     val isLocationEnabled: Boolean get() = !::sensorHub.isInitialized || sensorHub.isLocationEnabled()
-    val radioCapabilities: RadioCapabilities? get() = if (::radioScanner.isInitialized) radioScanner.capabilities else null
-
-    // Radio map persistence
-    private var radioMapLoaded = false
-    private var savedRadioVersion = 0L
-    private var savedMemoryVersion = 0L
-    private var lastRadioSaveMs = 0L
-    private var radioSaveJob: Job? = null
 
     private var lastPublishMs = 0L
     private var lastEventMs = 0L
@@ -153,14 +142,20 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
     private val deduper = PositionDeduper()
 
     // Test drive (no metro needed): see TestDriveMode
-    private lateinit var testRouteStore: TestRouteStore
+    /** Test-drive routes, kept apart from the metro lines so a recorded road is never taken for one. */
+    private lateinit var testRoutesDir: File
     private var testMode = TestDriveMode.OFF
     private var recorder: TestRouteRecorder? = null
     private var testRoute: MetroRoute? = null
     /** Tunnel test: the latest real GPS fix (never given to navigation) and when it came. */
     private var truth: GpsPoint? = null
     private var truthReceivedMs = 0L
-    private val errors = ErrorStats()
+    // Tunnel test: estimate vs. real GPS (count, sum, max, latest in metres)
+    private var errorCount = 0
+    private var errorSum = 0.0
+    private var errorMax = 0.0
+    private var errorLast: Double? = null
+    private val errorMean: Double? get() = if (errorCount == 0) null else errorSum / errorCount
 
     private val _testDrive = MutableStateFlow(TestDriveState())
     val testDrive: StateFlow<TestDriveState> = _testDrive
@@ -184,13 +179,9 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
         if (::appContext.isInitialized) return
         appContext = context.applicationContext
         sensorHub = SensorHub(appContext).also { it.listener = this }
-        radioScanner = RadioScanner(appContext).also {
-            it.listener = this
-            it.isKnownTransmitter = { key -> navigator.radioMap.anchor(key) != null }
-        }
-        cellScanner = CellScanner(appContext).also { it.listener = this }
+        cellScanner = CellScanner(appContext)
         routeService = MetroRouteService(appContext)
-        testRouteStore = TestRouteStore(File(appContext.filesDir, TEST_ROUTES_DIR))
+        testRoutesDir = File(appContext.filesDir, TEST_ROUTES_DIR)
         scope.launch {
             _lineStatus.value = "Metro line data: loading offline lines…"
             _cachedLines.value = routeService.preload()
@@ -198,7 +189,7 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
             else "Metro line data: none for this area yet — will download when online"
             if (navigator.hasFix) maybeLookupLines(navigator.currentLat, navigator.currentLon, SystemClock.elapsedRealtime(), force = true)
         }
-        scope.launch { loadRadioMap() }
+        scope.launch(Dispatchers.IO) { OBSOLETE_FILES.forEach { File(appContext.filesDir, it).delete() } }
         registerNetworkCallback()
     }
 
@@ -207,7 +198,7 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
         check(::appContext.isInitialized) { "call init() first" }
         clients.add(client)
         val ok = sensorHub.start()
-        if (!ok) clients.remove(client) else { radioScanner.start(); cellScanner.start() }
+        if (!ok) clients.remove(client) else cellScanner.start()
         return ok
     }
 
@@ -215,9 +206,7 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
         clients.remove(client)
         if (clients.isEmpty() && ::sensorHub.isInitialized) {
             sensorHub.stop()
-            radioScanner.stop()
             cellScanner.stop()
-            saveRadioMap(force = true)
         }
     }
 
@@ -225,9 +214,8 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
     fun restartSensors() {
         if (!::sensorHub.isInitialized || clients.isEmpty()) return
         sensorHub.stop()
-        radioScanner.stop()
         cellScanner.stop()
-        if (sensorHub.start()) { radioScanner.start(); cellScanner.start() }
+        if (sensorHub.start()) cellScanner.start()
     }
 
     fun setDestination(index: Int?) { navigator.setDestination(index); drainMessages(); publish(force = true) }
@@ -249,10 +237,13 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
     // ---- Test drive (no metro needed) -------------------------------------------------------
 
     /** Saved test routes, newest first (small files, read on demand). */
-    fun savedTestRoutes(): List<MetroRoute> = if (::testRouteStore.isInitialized) testRouteStore.list() else emptyList()
+    fun savedTestRoutes(): List<MetroRoute> = if (!::testRoutesDir.isInitialized) emptyList() else
+        (testRoutesDir.listFiles { f -> f.extension == "json" } ?: emptyArray())
+            .sortedByDescending { it.lastModified() }
+            .mapNotNull { f -> try { RouteJson.read(f.readText()) } catch (e: Exception) { null } }
 
     fun deleteTestRoutes() {
-        if (::testRouteStore.isInitialized) testRouteStore.deleteAll()
+        if (::testRoutesDir.isInitialized) testRoutesDir.listFiles()?.forEach { it.delete() }
     }
 
     /** First trip: record the road and its stops with GPS. */
@@ -279,7 +270,7 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
             publishTestDrive()
             return null
         }
-        note(if (testRouteStore.save(route)) String.format(Locale.US, "Test drive: saved %s (%.1f km, %d stations)",
+        note(if (saveTestRoute(route)) String.format(Locale.US, "Test drive: saved %s (%.1f km, %d stations)",
             route.lineName, route.length / 1000.0, route.stations.size) else "Test drive: could not save the route (storage full?)")
         rideTestRoute(route)
         return route
@@ -302,7 +293,7 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
     fun startTunnelTest(): Boolean {
         if (testMode != TestDriveMode.READY || !navigator.hasFix) return false
         testMode = TestDriveMode.TUNNEL
-        errors.reset()
+        errorCount = 0; errorSum = 0.0; errorMax = 0.0; errorLast = null
         truth = null
         _truthTrail.value = emptyList()
         navigator.onGpsLost(SystemClock.elapsedRealtime())
@@ -316,8 +307,8 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
     fun endTunnelTest() {
         if (testMode != TestDriveMode.TUNNEL) return
         testMode = TestDriveMode.READY
-        errors.mean?.let {
-            note(String.format(Locale.US, "Tunnel test ended: %d comparisons with real GPS, error mean %.0f m, max %.0f m", errors.count, it, errors.max))
+        errorMean?.let {
+            note(String.format(Locale.US, "Tunnel test ended: %d comparisons with real GPS, error mean %.0f m, max %.0f m", errorCount, it, errorMax))
         }
         truth = null
         publishTestDrive()
@@ -338,6 +329,16 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
         publish(force = true)
     }
 
+    /** Temp file + rename, so a full disk never leaves half a route. */
+    private fun saveTestRoute(route: MetroRoute): Boolean = try {
+        if (!testRoutesDir.exists()) testRoutesDir.mkdirs()
+        val tmp = File(testRoutesDir, "${route.id}.json.tmp")
+        tmp.writeText(RouteJson.write(route))
+        tmp.renameTo(File(testRoutesDir, "${route.id}.json")).also { if (!it) tmp.delete() }
+    } catch (e: Exception) {
+        false
+    }
+
     private fun recordTruth(point: GpsPoint, now: Long) {
         truth = point
         truthReceivedMs = now
@@ -354,10 +355,10 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
             routeName = testRoute?.lineName,
             recordedMeters = r?.lengthMeters ?: 0.0,
             recordedStations = r?.stationCount ?: 0,
-            lastErrorMeters = errors.last,
-            meanErrorMeters = errors.mean,
-            maxErrorMeters = if (errors.count > 0) errors.max else null,
-            comparisons = errors.count
+            lastErrorMeters = errorLast,
+            meanErrorMeters = errorMean,
+            maxErrorMeters = if (errorCount > 0) errorMax else null,
+            comparisons = errorCount
         )
     }
 
@@ -404,78 +405,6 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
 
     override fun onSatellites(inView: Int, usedInFix: Int) {
         _satellites.value = Satellites(inView, usedInFix)
-    }
-
-    // ---- RadioScanner.Listener / CellScanner.Listener ----------------------------------------
-
-    override fun onRadioScan(scan: RadioScan) {
-        // A scan learnt before the saved map is loaded would be lost with it, or the small new
-        // map would later overwrite the saved one: skip the few scans of the first moments.
-        if (!radioMapLoaded) return
-        navigator.onRadioScan(scan)
-        drainMessages()
-        publish(force = false)
-        saveRadioMap(force = false)
-    }
-
-    // ---- Radio map persistence -------------------------------------------------------------
-
-    private suspend fun loadRadioMap() {
-        val file = File(appContext.filesDir, RADIO_MAP_FILE)
-        val loaded = withContext(Dispatchers.IO) {
-            try { if (file.exists()) RadioMap.parse(file.readText()) else null } catch (e: Exception) {
-                Log.w(TAG, "Radio map unreadable, starting a new one", e); null
-            }
-        }
-        // Nothing is learnt before this point (onRadioScan waits for the load).
-        if (loaded != null && loaded.size > 0) navigator.radioMap = loaded
-        val memFile = File(appContext.filesDir, RIDE_MEMORY_FILE)
-        val memory = withContext(Dispatchers.IO) {
-            try { if (memFile.exists()) RideMemory.parse(memFile.readText()) else null } catch (e: Exception) {
-                Log.w(TAG, "Ride memory unreadable, starting a new one", e); null
-            }
-        }
-        // A memory with only the learnt vibration counts too. Before this point at most a few
-        // vibration readings can have been learnt (a run takes minutes), so nothing is lost.
-        if (memory != null && navigator.rideMemory.size == 0) navigator.rideMemory = memory
-        savedRadioVersion = navigator.radioMap.version
-        savedMemoryVersion = navigator.rideMemory.version
-        radioMapLoaded = true
-    }
-
-    /** Writes the learnt radio map (throttled; atomic temp-file + rename). */
-    private fun saveRadioMap(force: Boolean) {
-        if (!radioMapLoaded || !::appContext.isInitialized) return
-        val map = navigator.radioMap
-        val memory = navigator.rideMemory
-        val mapChanged = map.version != savedRadioVersion
-        val memoryChanged = memory.version != savedMemoryVersion
-        if ((!mapChanged && !memoryChanged) || radioSaveJob?.isActive == true) return
-        val now = SystemClock.elapsedRealtime()
-        if (!force && now - lastRadioSaveMs < RADIO_SAVE_INTERVAL_MS) return
-        lastRadioSaveMs = now
-        val mapVersion = map.version
-        val memoryVersion = memory.version
-        // Built on the main thread: the engine's data is only touched there.
-        val mapText = if (mapChanged) map.serialize() else null
-        val memoryText = if (memoryChanged) memory.serialize() else null
-        radioSaveJob = scope.launch {
-            val (mapOk, memoryOk) = withContext(Dispatchers.IO) {
-                Pair(mapText?.let { writeAtomically(RADIO_MAP_FILE, it) } ?: false,
-                    memoryText?.let { writeAtomically(RIDE_MEMORY_FILE, it) } ?: false)
-            }
-            if (mapOk) savedRadioVersion = mapVersion
-            if (memoryOk) savedMemoryVersion = memoryVersion
-        }
-    }
-
-    /** Temp file + rename, so a crash or full disk never leaves a half-written file. */
-    private fun writeAtomically(name: String, text: String): Boolean = try {
-        val tmp = File(appContext.filesDir, "$name.tmp")
-        tmp.writeText(text)
-        tmp.renameTo(File(appContext.filesDir, name)).also { if (!it) tmp.delete() }
-    } catch (e: Exception) {
-        Log.w(TAG, "Saving $name failed", e); false
     }
 
     // ---- Metro line data ------------------------------------------------------------------
@@ -590,7 +519,10 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
         // Tunnel test: compare with the real GPS position of the same moment.
         val reference = truth?.takeIf { testMode == TestDriveMode.TUNNEL && elapsedMs - truthReceivedMs <= TRUTH_MAX_AGE_MS }
         val error = reference?.let { GeoToolbox.calculateDistance(s.latitude, s.longitude, it.latitude, it.longitude) }
-        if (error != null) { errors.add(error); publishTestDrive() }
+        if (error != null) {
+            errorCount++; errorSum += error; errorLast = error; errorMax = max(errorMax, error)
+            publishTestDrive()
+        }
         val decision = deduper.decide(s.latitude, s.longitude, elapsedMs)
         // Same position as the last row: skipped, except in a tunnel test where the error still changes.
         if (decision == PositionDeduper.Decision.SKIP && error == null) return
@@ -603,8 +535,8 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
                     String.format(Locale.US, "Sensors: %s, vibration %.3f m/s², turn %+.1f °/s",
                         it.state.name.lowercase(), it.vibration, it.yawRateDps)
                 },
-                // The serving mobile cell: the "coverage detail" the radio map learns underground.
-                cellScanner.servingCell?.let { "Cell: ${it.key} ${it.dbm} dBm" }
+                // The serving mobile cell: the coverage along the route.
+                cellScanner.servingCell?.let { "Cell: $it" }
             ).joinToString(" | ").ifEmpty { null }
         )
         _positions.tryEmit(event)
@@ -631,5 +563,35 @@ object NavigationController : SensorHub.Listener, RadioScanner.Listener, CellSca
         lastPublishMs = now
         _state.value = navigator.state()
         _route.value = navigator.route
+    }
+}
+
+/**
+ * Decides which positions go to the log and the map: every new position, and an unchanged one
+ * only every [maxQuietMs] (a train standing at a platform gives one row, not one every 2 s, and
+ * the log still never goes quiet for longer than that). "Unchanged" is at the log's precision
+ * (6 decimals, about 0.1 m).
+ */
+class PositionDeduper(private val maxQuietMs: Long = 30_000L) {
+
+    enum class Decision { SKIP, LOG, LOG_AND_MARK }
+
+    private var lastLat = Long.MIN_VALUE
+    private var lastLon = Long.MIN_VALUE
+    private var lastMs = 0L
+
+    fun decide(lat: Double, lon: Double, elapsedMs: Long): Decision {
+        val la = (lat * 1e6).roundToLong()
+        val lo = (lon * 1e6).roundToLong()
+        val moved = la != lastLat || lo != lastLon
+        if (!moved && elapsedMs - lastMs < maxQuietMs) return Decision.SKIP
+        lastLat = la; lastLon = lo; lastMs = elapsedMs
+        return if (moved) Decision.LOG_AND_MARK else Decision.LOG
+    }
+
+    /** The next position is treated as new (e.g. after the map was cleared). */
+    fun reset() {
+        lastLat = Long.MIN_VALUE
+        lastLon = Long.MIN_VALUE
     }
 }

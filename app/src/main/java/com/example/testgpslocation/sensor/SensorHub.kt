@@ -21,8 +21,8 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.testgpslocation.engine.MotionSample
 import com.example.testgpslocation.engine.MotionState
-import com.example.testgpslocation.engine.Pdr
 import com.example.testgpslocation.models.GpsPoint
+import com.example.testgpslocation.service.HandyFeed
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.location.FusedLocationProviderClient
@@ -42,8 +42,7 @@ data class DeviceCapabilities(
     val hasAccelerometer: Boolean,
     val hasRotationVector: Boolean,
     val hasGyroscope: Boolean,
-    val hasBarometer: Boolean,
-    val hasStepDetector: Boolean
+    val hasBarometer: Boolean
 )
 
 /**
@@ -54,7 +53,8 @@ data class DeviceCapabilities(
  *  - Google fused location (cell / Wi-Fi / GPS mix) → isGnss = false, used when there is no
  *    satellite fix (e.g. underground with network);
  *  - without Google Play services: the platform network provider instead of fused.
- * "GPS lost" fires when no satellite fix arrived for [GPS_TIMEOUT_MS].
+ * "GPS lost" fires when no satellite fix arrived for [GPS_TIMEOUT_MS]; the navigator also treats
+ * a run of only poor fixes as lost.
  *
  * Motion: one [MotionSample] every [SAMPLE_PERIOD_MS] with world-frame acceleration and a
  * stationary / walking / moving classification. Falls back to the raw accelerometer (gravity
@@ -79,7 +79,6 @@ class SensorHub(context: Context) : SensorEventListener {
     private val rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private val pressure = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
-    private val stepDetector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
 
     private val hasGnss = try { locationManager.allProviders.contains(LocationManager.GPS_PROVIDER) } catch (_: Exception) { false }
     private val hasPlayServices = try {
@@ -95,8 +94,7 @@ class SensorHub(context: Context) : SensorEventListener {
         hasAccelerometer = rawAccel != null,
         hasRotationVector = rotationVector != null,
         hasGyroscope = gyroscope != null,
-        hasBarometer = pressure != null,
-        hasStepDetector = stepDetector != null
+        hasBarometer = pressure != null
     )
 
     var listener: Listener? = null
@@ -121,13 +119,10 @@ class SensorHub(context: Context) : SensorEventListener {
     // Rolling buffers for classification
     private val accelMagnitudes = RingBuffer(ROLLING_SAMPLES)
     private val gyroMagnitudes = RingBuffer(ROLLING_SAMPLES)
-    private val stepTimes = ArrayDeque<Long>()
     private var stillSinceMs = 0L
-    private var stepsInWindow = 0
     // Turn rate about the vertical (gravity) axis: magnetometer independent
     private var yawSum = 0.0
     private var yawCount = 0
-    private var stepDetectorActive = false
 
     // Pressure: rapid change over a few seconds (stairs / escalator into a station)
     private val pressureHistory = ArrayDeque<Pair<Long, Float>>()
@@ -173,6 +168,11 @@ class SensorHub(context: Context) : SensorEventListener {
             var used = 0
             for (i in 0 until status.satelliteCount) if (status.usedInFix(i)) used++
             listener?.onSatellites(status.satelliteCount, used)
+        }
+
+        // The receiver is off (e.g. while the Handy feed replaces it): no satellites, not the last count.
+        override fun onStopped() {
+            listener?.onSatellites(0, 0)
         }
     }
 
@@ -220,8 +220,6 @@ class SensorHub(context: Context) : SensorEventListener {
         rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         gyroscope?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         pressure?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler) }
-        stepDetectorActive = stepDetector != null && hasActivityPermission() &&
-            sensorManager.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_FASTEST, handler)
         handler.postDelayed(gpsWatchdog, 1000L)
         isRunning = true
         return true
@@ -249,8 +247,6 @@ class SensorHub(context: Context) : SensorEventListener {
         isRunning = false
         windowStartMs = 0L
         stillSinceMs = 0L
-        stepsInWindow = 0
-        stepDetectorActive = false
     }
 
     fun isLocationEnabled(): Boolean = try {
@@ -258,21 +254,19 @@ class SensorHub(context: Context) : SensorEventListener {
         else locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
     } catch (_: Exception) { true }
 
-    private fun hasActivityPermission() =
-        Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
-            ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
-
     private fun deliver(loc: Location, isGnss: Boolean) {
         val now = SystemClock.elapsedRealtime()
         // Stale fixes (e.g. a cached "last location" delivered late) are ignored.
         val fixElapsed = loc.elapsedRealtimeNanos / 1_000_000
         if (fixElapsed > 0 && now - fixElapsed > STALE_FIX_MS) return
+        @Suppress("DEPRECATION")
+        val mock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) loc.isMock else loc.isFromMockProvider
+        // While the Handy feed is on, mock fixes are this app's own position coming back: not GPS.
+        if (mock && HandyFeed.enabled) return
         if (isGnss) {
             lastGnssFixMs = now
             gpsLostReported = false
         }
-        @Suppress("DEPRECATION")
-        val mock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) loc.isMock else loc.isFromMockProvider
         listener?.onLocationFix(
             GpsPoint(
                 latitude = loc.latitude,
@@ -315,10 +309,6 @@ class SensorHub(context: Context) : SensorEventListener {
                 }
             }
             Sensor.TYPE_PRESSURE -> onPressure(event.values[0])
-            Sensor.TYPE_STEP_DETECTOR -> {
-                stepTimes.addLast(SystemClock.elapsedRealtime())
-                stepsInWindow++
-            }
         }
     }
 
@@ -347,25 +337,22 @@ class SensorHub(context: Context) : SensorEventListener {
             accelEast = if (windowCount > 0) sumEast / windowCount else 0.0,
             accelNorth = if (windowCount > 0) sumNorth / windowCount else 0.0,
             pressureRapidChange = pressureRapidChange,
-            steps = if (stepDetectorActive) stepsInWindow else null,
-            stepCadenceHz = cadenceHz(),
-            deviceHeadingDeg = if (hasRotation) Pdr.headingFromRotation(rotation) ?: Double.NaN else Double.NaN,
             orientationKnown = hasRotation,
             // Bearing rate: clockwise positive, degrees per second.
             yawRateDps = if (yawCount > 0) -Math.toDegrees(yawSum / yawCount) else Double.NaN,
             vibration = accelMagnitudes.std() ?: Double.NaN
         )
-        windowStartMs = now; sumEast = 0.0; sumNorth = 0.0; windowCount = 0; stepsInWindow = 0
+        windowStartMs = now; sumEast = 0.0; sumNorth = 0.0; windowCount = 0
         yawSum = 0.0; yawCount = 0
         listener?.onMotionSample(sample)
     }
 
     private fun classify(now: Long): MotionState {
-        while (stepTimes.isNotEmpty() && now - stepTimes.first() > STEP_WINDOW_MS) stepTimes.removeFirst()
         val accelStd = accelMagnitudes.std()
         if (accelStd == null) { stillSinceMs = 0L; return MotionState.MOVING } // warming up: not enough data yet
         val gyroMean = gyroMagnitudes.mean()
-        val walking = stepTimes.size >= MIN_STEPS_FOR_WALKING || accelStd > WALKING_ACCEL_STD
+        // Shaking far beyond any vehicle: the phone (or its box) is being carried.
+        val walking = accelStd > WALKING_ACCEL_STD
         val stillThreshold = if (linearAccel != null) STILL_ACCEL_STD else STILL_ACCEL_STD_RAW
         val still = !walking && accelStd < stillThreshold && (gyroscope == null || gyroMean < STILL_GYRO_MEAN)
         if (still) { if (stillSinceMs == 0L) stillSinceMs = now } else stillSinceMs = 0L
@@ -374,13 +361,6 @@ class SensorHub(context: Context) : SensorEventListener {
             still && now - stillSinceMs >= STILL_CONFIRM_MS -> MotionState.STATIONARY
             else -> MotionState.MOVING
         }
-    }
-
-    /** Steps per second over the recent step window; 0 when not walking. */
-    private fun cadenceHz(): Double {
-        if (stepTimes.size < 2) return 0.0
-        val span = stepTimes.last() - stepTimes.first()
-        return if (span <= 0) 0.0 else (stepTimes.size - 1) * 1000.0 / span
     }
 
     private fun onPressure(hPa: Float) {
@@ -413,12 +393,11 @@ class SensorHub(context: Context) : SensorEventListener {
         const val GPS_TIMEOUT_MS = 6_000L
         private const val GNSS_INTERVAL_MS = 1_000L
         private const val FUSED_INTERVAL_MS = 2_000L
-        private const val STALE_FIX_MS = 30_000L
+        /** A fix older than this describes where the phone was, not where it is (a 30 s old fix in a train is 300+ m off). */
+        private const val STALE_FIX_MS = 10_000L
         private const val NO_GNSS_TRUSTED_ACCURACY = 25f
         private const val ROLLING_SAMPLES = 100 // ~2 s at SENSOR_DELAY_GAME (50 Hz)
         private const val MIN_SAMPLES_FOR_STD = 10
-        private const val STEP_WINDOW_MS = 3_000L
-        private const val MIN_STEPS_FOR_WALKING = 3
         private const val WALKING_ACCEL_STD = 1.2
         private const val STILL_ACCEL_STD = 0.06
         private const val STILL_ACCEL_STD_RAW = 0.09 // raw accelerometer is noisier

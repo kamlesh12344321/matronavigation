@@ -5,4 +5,5 @@
     <item android:id="@+id/menuClearMap" android:title="@string/clear_map" />
     <item android:id="@+id/menuRefreshLines" android:title="@string/refresh_lines" />
     <item android:id="@+id/menuDownloadCity" android:title="@string/download_city" />
+    <item android:id="@+id/menuHandyFeed" android:title="@string/handy_feed" android:checkable="true" />
 </menu>

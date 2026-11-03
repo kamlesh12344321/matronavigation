@@ -54,30 +54,41 @@ class EdgeCaseTest {
         nav.onGpsLost(clock)
     }
 
-    @Test
-    fun stopsAreSeenWithTheStillnessLearntFromGps() {
-        // With GPS: 10 s standing (idling engine: vibration 0.10, which the fixed rule calls
-        // "moving"), then 10 s driving north at 10 m/s (vibration 0.40). One fix per second.
-        fun second(lat: Double, speed: Float, vibration: Double) {
-            gnss(lat, speed = speed, dtMs = 100)
-            repeat(9) { clock += 100; nav.onMotion(MotionSample(clock, 0.1, MotionState.MOVING, 0, 0.0, 0.0, vibration = vibration)) }
-        }
-        repeat(10) { second(12.90, 0f, 0.10) }
-        repeat(10) { k -> second(12.90 + (k + 1) * 10 / mPerDeg, 10f, 0.40) }
-        assertEquals(0.2, nav.rideMemory.vibration.stillThreshold!!, 0.01)
-
-        fun drive(seconds: Double, vibration: Double) = repeat((seconds * 10).toInt()) {
-            clock += 100; nav.onMotion(MotionSample(clock, 0.1, MotionState.MOVING, 0, 0.0, 0.0, vibration = vibration))
-        }
+    /** Driving north with GPS (vibration 0.40) for 15 s, then GPS lost while still driving for 10 s. */
+    private fun driveNorthThenLoseGps() {
+        repeat(15) { k -> gnss(12.90 + k * 10 / mPerDeg, speed = 10f, dtMs = 100); repeat(9) { vibrating(0.40) } }
         nav.onGpsLost(clock)
-        drive(5.0, 0.40)
+        repeat(100) { vibrating(0.40) }
         assertTrue("still driving", nav.state().speedMps > 5.0)
-        // Stopped at a light, engine idling: the fixed rule still says "moving", the learnt one does not.
-        drive(3.0, 0.10)
+    }
+
+    /** One motion sample the phone's fixed still rule calls "moving" (orientation known). */
+    private fun vibrating(vibration: Double, accelNorth: Double = 0.0) {
+        clock += 100
+        nav.onMotion(MotionSample(clock, 0.1, MotionState.MOVING, 0, 0.0, accelNorth, orientationKnown = true, vibration = vibration))
+    }
+
+    @Test
+    fun anIdlingEngineStopIsSeenFromTheVibrationDrop() {
+        // Nothing learnt or stored: at the light the engine idles (vibration 0.10), which the
+        // phone's fixed rule calls "moving"; it is a clear drop from this ride's 0.40.
+        driveNorthThenLoseGps()
+        repeat(50) { vibrating(0.40, accelNorth = -2.0) } // braking: 10 m/s to 0 in 5 s
+        repeat(30) { vibrating(0.10) }
         val stopLat = nav.currentLat
-        drive(8.0, 0.10)
+        repeat(80) { vibrating(0.10) }
         assertEquals(0.0, nav.state().speedMps, 1e-9)
         assertEquals(stopLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aQuietStretchWithoutBrakingIsNotTakenForAStop() {
+        // Smooth road: the vibration drops as much as at a stop, but nothing braked.
+        driveNorthThenLoseGps()
+        val before = nav.currentLat
+        repeat(200) { vibrating(0.10) }
+        assertTrue("speed ${nav.state().speedMps}", nav.state().speedMps > 5.0)
+        assertTrue("moved", (nav.currentLat - before) * mPerDeg > 100.0)
     }
 
     @Test

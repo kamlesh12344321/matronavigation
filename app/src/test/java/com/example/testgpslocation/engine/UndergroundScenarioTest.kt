@@ -116,6 +116,61 @@ class UndergroundScenarioTest {
     }
 
     @Test
+    fun stopsAreFoundWhenThePhoneNeverReadsStill() {
+        // Platform air-conditioning: the phone's fixed rule says "moving" through every 25 s
+        // dwell. The drop from the running vibration, confirmed by the braking, finds each stop;
+        // the departure is still taken from the acceleration. Nothing learnt beforehand.
+        repeat(3) { k ->
+            val r = ride("aircon-$k", SimConfig(stillReadsMoving = true, seed = 1200 + k))
+            assertEquals("seed $k", allStops, r.stationsAtStops)
+            assertTrue("seed $k stop errors ${r.stopErrors}", r.stopErrors.all { it < 5.0 })
+            assertTrue("seed $k zero speed at dwell ${r.zeroSpeedDwellFraction}", r.zeroSpeedDwellFraction > 0.9)
+        }
+    }
+
+    @Test
+    fun aThirtySecondStopThenDepartureKeepsTheSequence() {
+        // The longest dwell expected on the line, at every station, with and without air-con.
+        listOf(false, true).forEach { aircon ->
+            val r = ride("dwell30-$aircon", SimConfig(dwellSec = 30.0, stillReadsMoving = aircon, segmentSpeeds = true, seed = 1300))
+            assertEquals("aircon $aircon", allStops, r.stationsAtStops)
+            assertTrue("aircon $aircon: position kept still while standing (${r.zeroSpeedDwellFraction})", r.zeroSpeedDwellFraction > 0.9)
+        }
+    }
+
+    @Test
+    fun aBoxKnockedAtEveryPlatformNeverLosesTheStops() {
+        // Knocks cut every dwell's still reading short, so the accelerometer bias is learnt from a
+        // few noisy seconds. That error used to make the braking check fail at the next stop, the
+        // missed stop left the drift in, and every later stop was missed (errors of kilometres).
+        repeat(10) { k ->
+            val r = ride("knocked-$k", SimConfig(jiggleAtStations = true, seed = 5000 + k))
+            assertTrue("seed $k stop errors ${r.stopErrors}", r.stopErrors.all { it < 20.0 })
+            assertTrue("seed $k mean ${r.meanMovingError}", r.meanMovingError < 40.0)
+        }
+    }
+
+    @Test
+    fun coordinatesStayTheSameOnlyWhileTheTrainStands() {
+        // While the train moves the estimate moves too (at most a second or two still, while a
+        // pull-away is being confirmed); while it stands the coordinates do not change.
+        val express = setOf(3, 5, 7, 9, 11, 13)
+        val situations = listOf(
+            "normal" to SimConfig(seed = 1400),
+            "varied" to SimConfig(segmentSpeeds = true, seed = 1401),
+            "aircon" to SimConfig(stillReadsMoving = true, dwellSec = 30.0, seed = 1402),
+            "express" to SimConfig(skipStations = express, segmentSpeeds = true, seed = 1403),
+            "signal" to SimConfig(signalStopAt = 5500.0, seed = 1404),
+            "knocked" to SimConfig(jiggleAtStations = true, seed = 1405)
+        )
+        for ((name, cfg) in situations) {
+            val r = ride("rule-$name", cfg)
+            assertTrue("$name: same coordinates for ${r.longestRepeatWhileMovingSec} s while moving", r.longestRepeatWhileMovingSec <= 2.0)
+            assertEquals("$name: moved while standing", 0.0, r.movedWhileStoppedSec, 1e-9)
+        }
+    }
+
+    @Test
     fun signalStopInTheTunnelIsNotTakenForAStation() {
         // Held at a signal 550 m before S3 for 40 s.
         val r = ride("signal-stop", SimConfig(signalStopAt = 3050.0, seed = 13))
@@ -159,34 +214,6 @@ class UndergroundScenarioTest {
         repeat(4) { k ->
             val r = ride("varied-express-$k", SimConfig(segmentSpeeds = true, skipStations = express, seed = 700 + k))
             assertEquals("seed $k", allStops.filter { it.removePrefix("S").toInt() !in express }, r.stationsAtStops)
-        }
-    }
-
-    @Test
-    fun learntRunsAndWifiImproveExpressRidesOnARealisticLine() {
-        val world = RadioWorld(TunnelWorld.route)
-        val first = ride("varied-learn", SimConfig(segmentSpeeds = true, radio = world, seed = 801))
-        // A run is learnt only when both of its stops were trustworthy snaps.
-        assertTrue("runs learnt ${first.navigator.rideMemory.size}", first.navigator.rideMemory.size >= 12)
-        val without = ride("varied-express-nothing", SimConfig(segmentSpeeds = true, skipStations = express, seed = 802))
-        val with = ride("varied-express-learnt", SimConfig(segmentSpeeds = true, skipStations = express, radio = world,
-            rideMemory = RideMemory.parse(first.navigator.rideMemory.serialize()), radioMap = RadioMap.parse(first.navigator.radioMap.serialize()), seed = 802))
-        assertEquals(without.expectedStations, with.stationsAtStops)
-        assertTrue("with ${with.meanMovingError} vs without ${without.meanMovingError}", with.meanMovingError < without.meanMovingError)
-        // Station-only Wi-Fi cannot pin down a run through a skipped station (see above).
-        assertTrue("max with ${with.maxMovingError} vs without ${without.maxMovingError}", with.maxMovingError < 1.2 * without.maxMovingError)
-    }
-
-    @Test
-    fun secondRideWithEverythingLearntStaysAccurate() {
-        val world = RadioWorld(TunnelWorld.route)
-        repeat(3) { k ->
-            val first = TunnelSimulator(SimConfig(segmentSpeeds = true, radio = world, seed = 900 + k)).run()
-            val second = ride("second-ride-$k", SimConfig(segmentSpeeds = true, radio = world, seed = 950 + k,
-                rideMemory = RideMemory.parse(first.navigator.rideMemory.serialize()), radioMap = RadioMap.parse(first.navigator.radioMap.serialize())))
-            assertEquals("seed $k", allStops, second.stationsAtStops)
-            assertTrue("seed $k mean ${second.meanMovingError}", second.meanMovingError < 50.0)
-            assertTrue("seed $k max ${second.maxMovingError}", second.maxMovingError < 350.0)
         }
     }
 
@@ -270,70 +297,5 @@ class UndergroundScenarioTest {
         println("gyro mean ${gyro.meanMovingError} max ${gyro.maxMovingError} / without mean ${noGyro.meanMovingError} max ${noGyro.maxMovingError}")
         assertTrue("with ${gyro.maxMovingError} vs without ${noGyro.maxMovingError}", gyro.maxMovingError < 0.5 * noGyro.maxMovingError)
         assertTrue("mean with ${gyro.meanMovingError} vs without ${noGyro.meanMovingError}", gyro.meanMovingError < 0.5 * noGyro.meanMovingError)
-    }
-
-    // ---- Wi-Fi ----------------------------------------------------------------------------------
-
-    @Test
-    fun radioMapLearntOnFirstRideCorrectsLaterRides() {
-        val world = RadioWorld(TunnelWorld.route)
-        val first = ride("radio-learn", SimConfig(radio = world, seed = 21))
-        val map = first.navigator.radioMap
-        assertTrue("places learnt ${map.size}", map.size >= 16)
-
-        // Express ride: skipped stations are only recognisable by their radio.
-        val express = setOf(3, 5, 7, 9, 11, 13)
-        val without = ride("express-no-radio", SimConfig(skipStations = express, seed = 22))
-        val with = ride("express-radio", SimConfig(skipStations = express, radio = world, radioMap = RadioMap.parse(map.serialize()), seed = 22))
-        assertTrue("radio corrections ${with.navigator.state().radioCorrections}", with.navigator.state().radioCorrections > 0)
-        assertTrue("with ${with.meanMovingError} vs without ${without.meanMovingError}", with.meanMovingError < without.meanMovingError)
-        // Wi-Fi is heard only around stations and scanned every 30 s, so a train running through a
-        // skipped station may not hear it at all: the worst case between stops is not reduced
-        // (the motion sensors already release the hold at a skipped station, see below).
-        assertTrue("max with ${with.maxMovingError} vs without ${without.maxMovingError}", with.maxMovingError < 1.2 * without.maxMovingError)
-        assertEquals(allStops.filter { it.removePrefix("S").toInt() !in express }, with.stationsAtStops)
-    }
-
-    @Test
-    fun coldStartUndergroundWithNoFixAtAllUsesTheRadioMap() {
-        val world = RadioWorld(TunnelWorld.route)
-        val map = ride("radio-learn-2", SimConfig(radio = world, seed = 31)).navigator.radioMap
-        // Never any satellite or network fix: only the learnt radio map knows where we are.
-        val r = ride("cold-start-radio", SimConfig(startStation = 8, endStation = 14, gpsUntilMeters = null, entranceFix = false,
-            radio = world, radioMap = map, seed = 32))
-        assertEquals((9..14).map { "S$it" }, r.stationsAtStops)
-        assertTrue("stop errors ${r.stopErrors}", r.stopErrors.all { it < 5.0 })
-    }
-
-    // ---- Mobile cells (no Wi-Fi) ----------------------------------------------------------------
-
-    @Test
-    fun cellFingerprintsFromAnEarlierRideCorrectAnExpressRide() {
-        // No Wi-Fi anywhere: only the in-tunnel mobile cells (one per station, handover near mid-tunnel).
-        val world = RadioWorld(TunnelWorld.route, wifi = false, cells = true)
-        val first = ride("cell-learn", SimConfig(radio = world, seed = 25))
-        val map = first.navigator.radioMap
-        assertTrue("places learnt ${map.size}", map.size >= 40)
-
-        val express = setOf(3, 5, 7, 9, 11, 13)
-        val without = ride("express-no-cells", SimConfig(skipStations = express, seed = 26))
-        val with = ride("express-cells", SimConfig(skipStations = express, radio = world, radioMap = RadioMap.parse(map.serialize()), seed = 26))
-        println("cells: with mean ${with.meanMovingError} max ${with.maxMovingError} / without mean ${without.meanMovingError} max ${without.maxMovingError}")
-        assertTrue("radio corrections ${with.navigator.state().radioCorrections}", with.navigator.state().radioCorrections > 0)
-        assertEquals(allStops.filter { it.removePrefix("S").toInt() !in express }, with.stationsAtStops)
-        assertTrue("with ${with.meanMovingError} vs without ${without.meanMovingError}", with.meanMovingError < without.meanMovingError)
-        assertTrue("max with ${with.maxMovingError} vs without ${without.maxMovingError}", with.maxMovingError < 1.2 * without.maxMovingError)
-    }
-
-    @Test
-    fun coldStartUndergroundWithOnlyMobileCells() {
-        val world = RadioWorld(TunnelWorld.route, wifi = false, cells = true)
-        val map = ride("cell-learn-2", SimConfig(radio = world, seed = 27)).navigator.radioMap
-        // Never any GPS or network fix: the learnt cells alone place the train on the line.
-        val r = ride("cold-start-cells", SimConfig(startStation = 8, endStation = 14, gpsUntilMeters = null, entranceFix = false,
-            radio = world, radioMap = map, seed = 28))
-        println("cold start cells: stops ${r.stationsAtStops} errors ${r.stopErrors}")
-        assertEquals((9..14).map { "S$it" }, r.stationsAtStops)
-        assertTrue("stop errors ${r.stopErrors}", r.stopErrors.all { it < 20.0 })
     }
 }

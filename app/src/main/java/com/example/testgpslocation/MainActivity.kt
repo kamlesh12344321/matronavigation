@@ -40,6 +40,7 @@ import com.example.testgpslocation.engine.PositionSource
 import com.example.testgpslocation.engine.TestDriveMode
 import com.example.testgpslocation.engine.TestDriveState
 import com.example.testgpslocation.map.NavigationOverlay
+import com.example.testgpslocation.service.HandyFeed
 import com.example.testgpslocation.service.LocationTrackerService
 import com.example.testgpslocation.utils.NetworkStatus
 import com.example.testgpslocation.utils.TelemetryLogger
@@ -175,6 +176,7 @@ class MainActivity : AppCompatActivity() {
                 launch { NavigationController.testDrive.collect(::renderTestDrive) }
                 launch { NavigationController.cachedLines.collect { cachedLines = it } }
                 launch { NavigationController.lineStatus.collect { offlineText.text = it } }
+                launch { HandyFeed.status.collect { refreshWarnings() } }
                 launch {
                     LocationTrackerService.isRunning.collect { running ->
                         btnLogging.setText(if (running) R.string.stop_logging else R.string.start_logging)
@@ -290,6 +292,7 @@ class MainActivity : AppCompatActivity() {
         PopupMenu(this, anchor).apply {
             inflate(R.menu.map_menu)
             menu.findItem(R.id.menuDetails).setTitle(if (details.visibility == View.VISIBLE) R.string.hide_details else R.string.show_details)
+            menu.findItem(R.id.menuHandyFeed).isChecked = HandyFeed.isWanted(this@MainActivity)
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     R.id.menuTestDrive -> showTestDriveDialog()
@@ -300,6 +303,11 @@ class MainActivity : AppCompatActivity() {
                     }
                     R.id.menuRefreshLines -> NavigationController.refreshLinesHere()
                     R.id.menuDownloadCity -> NavigationController.downloadCity()
+                    R.id.menuHandyFeed -> {
+                        HandyFeed.setWanted(this@MainActivity, !item.isChecked)
+                        Toast.makeText(this@MainActivity, if (item.isChecked) R.string.handy_feed_off else R.string.handy_feed_on, Toast.LENGTH_LONG).show()
+                        refreshWarnings()
+                    }
                 }
                 true
             }
@@ -400,8 +408,8 @@ class MainActivity : AppCompatActivity() {
     /** What each marker colour means. */
     private fun legend(): CharSequence = SpannableStringBuilder().apply {
         listOf(
-            PositionSource.GPS to "GPS", PositionSource.TRACK to "Track", PositionSource.NETWORK to "Network",
-            PositionSource.RADIO to "Wi-Fi / cell", PositionSource.DEAD_RECKONING to "Dead reckoning"
+            PositionSource.GPS to "GPS", PositionSource.NETWORK to "Network", PositionSource.TRACK to "Track",
+            PositionSource.DEAD_RECKONING to "Dead reckoning"
         ).forEach { (source, name) ->
             append("●", ForegroundColorSpan(NavigationOverlay.colorFor(source)), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             append(" $name   ")
@@ -419,7 +427,6 @@ class MainActivity : AppCompatActivity() {
             s.gpsAvailable -> "GPS ACTIVE" to "#4CAF50"
             s.source == PositionSource.TRACK -> "NO GPS · UNDERGROUND NAV" to "#FFB300"
             s.source == PositionSource.NETWORK -> "NO GPS · NETWORK LOCATION" to "#FFB300"
-            s.source == PositionSource.RADIO -> "NO GPS · WI-FI / CELL LOCATION" to "#FFB300"
             s.source == PositionSource.DEAD_RECKONING -> "NO GPS · DEAD RECKONING" to "#FF7043"
             else -> "WAITING FOR LOCATION" to "#9E9E9E"
         }
@@ -441,11 +448,8 @@ class MainActivity : AppCompatActivity() {
             append(" · satellites ${sats.usedInFix}/${sats.inView}")
             if (!s.gpsAvailable && s.motion != MotionState.MOVING && s.source != PositionSource.NONE) append(" · ").append(s.motion.name.lowercase())
             s.lastRecoveryDriftMeters?.let { append(String.format(Locale.US, " · last GPS-recovery error %.0f m", it)) }
-            append(" · radio: ${s.radioSignalsHeard} heard, ${s.radioPlacesLearnt} places learnt")
-            if (s.radioCorrections > 0) append(", ${s.radioCorrections} fixes")
-            if (s.segmentsLearnt > 0) append(" · ${s.segmentsLearnt} runs learnt")
+            if (s.networkCorrections > 0) append(" · ${s.networkCorrections} network fixes")
             if (s.curveCorrections > 0) append(" · ${s.curveCorrections} curve fixes")
-            if (!s.gpsAvailable && s.pdrSteps > 0) append(" · ${s.pdrSteps} steps")
         }
 
         lineText.text = s.lineName?.let { if (s.onTrack) "🚇 $it" else "🚇 $it (not on this line)" }
@@ -514,7 +518,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun currentWarning(s: NavState): Warning? {
         val caps = NavigationController.capabilities
-        val radio = NavigationController.radioCapabilities
         return when {
             !hasAnyLocation() -> Warning("Location permission is needed to navigate.") {
                 if (permissionAskedOnce && !shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION)) openAppSettings()
@@ -525,6 +528,12 @@ class MainActivity : AppCompatActivity() {
             TelemetryLogger.lastError != null -> Warning(TelemetryLogger.lastError!!, null)
             LocationTrackerService.isRunning.value && !isIgnoringBatteryOptimizations() ->
                 Warning("Battery optimisation may pause navigation with the screen off.") { openBatterySettings() }
+            HandyFeed.isWanted(this) && HandyFeed.status.value == HandyFeed.Status.NOT_ALLOWED ->
+                Warning("Nemo Handy cannot get the position: in Developer options, set \"Select mock location app\" to Metro Navigator.") {
+                    safeStart(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                }
+            HandyFeed.isWanted(this) && !LocationTrackerService.isRunning.value ->
+                Warning("Start logging to send the position to Nemo Handy.", null)
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !NotificationManagerCompat.from(this).areNotificationsEnabled() ->
                 Warning("Notifications are off: the logging notification will be hidden.") { openNotificationSettings() }
             caps != null && !caps.hasLinearAcceleration && !caps.hasAccelerometer ->
@@ -532,19 +541,6 @@ class MainActivity : AppCompatActivity() {
             caps != null && !caps.hasGnss -> Warning("This phone has no GPS receiver: only network location is available.", null)
             caps != null && !caps.hasRotationVector ->
                 Warning("No orientation sensor: pick your destination so the direction of travel is known.", null)
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && caps?.hasStepDetector == true &&
-                ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED ->
-                Warning("Allow \"Physical activity\" so walking is not counted as train movement.") { requestPermissions() }
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && radio?.rtt == true &&
-                ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED ->
-                Warning("Allow \"Nearby devices\" so Wi-Fi ranging can correct the position underground.") {
-                    if (permissionAskedOnce && !shouldShowRequestPermissionRationale(Manifest.permission.NEARBY_WIFI_DEVICES)) openAppSettings()
-                    else requestPermissions()
-                }
-            radio != null && radio.wifi && !radio.wifiScanning ->
-                Warning("Wi-Fi scanning is off: turn on Wi-Fi (or \"Wi-Fi scanning\") for better underground accuracy.") {
-                    safeStart(Intent(Settings.ACTION_WIFI_SETTINGS))
-                }
             s.mockLocation -> Warning("Mock (fake) GPS locations detected; results are not real.", null)
             else -> null
         }
@@ -607,9 +603,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestPermissions() {
         permissionAskedOnce = true
         val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) perms.add(Manifest.permission.ACTIVITY_RECOGNITION)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.POST_NOTIFICATIONS)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         requestPermissions(perms.toTypedArray(), PERMISSION_REQUEST_CODE)
     }

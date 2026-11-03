@@ -7,7 +7,6 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.nio.file.Files
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.ln
@@ -111,32 +110,11 @@ class TestDriveTest {
     }
 
     @Test
-    fun savedRoutesSurviveAndCanBeDeleted() {
-        val dir = Files.createTempDirectory("test_routes").toFile()
-        try {
-            val store = TestRouteStore(dir)
-            val route = recordFirstTrip().build("test_42", "Test route 42")!!
-            assertTrue(store.save(route))
-            val back = store.list().single()
-            assertEquals("Test route 42", back.lineName)
-            assertEquals(route.stations.map { it.name }, back.stations.map { it.name })
-            assertEquals(route.length, back.length, 0.01)
-            store.deleteAll()
-            assertTrue(store.list().isEmpty())
-        } finally {
-            dir.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun errorStatistics() {
-        val e = ErrorStats()
-        assertNull(e.mean)
-        listOf(10.0, 30.0, 20.0).forEach(e::add)
-        assertEquals(20.0, e.mean!!, 1e-9)
-        assertEquals(30.0, e.max, 1e-9)
-        assertEquals(20.0, e.last!!, 1e-9)
-        e.reset()
-        assertEquals(0, e.count)
+    fun aSavedRouteReadsBackTheSame() {
+        val route = recordFirstTrip().build("test_42", "Test route 42")!!
+        val back = RouteJson.read(RouteJson.write(route))!!
+        assertEquals("Test route 42", back.lineName)
+        assertEquals(route.stations.map { it.name }, back.stations.map { it.name })
+        assertEquals(route.length, back.length, 0.01)
     }
 }

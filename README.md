@@ -4,7 +4,7 @@ Two Android apps sharing one library:
 
 | Module | App | What it does |
 |---|---|---|
-| `:app` | **Metro Navigator** | Position underground with no GPS and no network, the way Google Maps does it — free, on the phone, no backend: metro lines of the current city (map constraint), inertial speed with zero-velocity updates, an inertial odometer that identifies every stop's station, self-learnt Wi-Fi and mobile-cell fingerprints with handover checkpoints (stations and tunnels), Wi-Fi RTT, per-run speed memory, gyroscope curve checks, step counting, and a Hidden Markov Model that fuses them on the track. Logs every position to a new file each time logging starts. |
+| `:app` | **Metro Navigator** | Position underground with no GPS and no network — on the phone, no backend, nothing learnt or stored between rides. Source order: GPS → network location (Google fused: Wi-Fi and cell towers) → dead reckoning on the metro line (inertial speed with zero-velocity updates, stop and departure detection, snapping to each station the train stops at, an inertial odometer that identifies the station, gyroscope curve checks). Without a line: dead reckoning along the gyroscope heading. Logs every position (and the serving mobile cell) to a new file each time logging starts, and (menu switch) sends its position to Nemo Handy as the phone's location while there is no GPS. |
 | `:gpslogger` | **GPS Logger** | Writes every GPS fix (time, lat, lon, accuracy) to a new file each time logging starts and shows it in a list. |
 | `:core` | library | `GpsPoint`, `GeoToolbox`, `NetworkStatus`, `TelemetryLogger`. |
 
@@ -12,7 +12,7 @@ Two Android apps sharing one library:
 
 ```bash
 ./gradlew assembleDebug          # build both apps
-./gradlew testDebugUnitTest      # 104 unit, component, test-drive and long-tunnel simulation tests (Metro Navigator)
+./gradlew testDebugUnitTest      # 92 unit, edge-case, Handy-feed, test-drive and long-tunnel simulation tests
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb install -r gpslogger/build/outputs/apk/debug/gpslogger-debug.apk
 ```
@@ -35,7 +35,14 @@ python3 scripts/build_metro_bundle.py pune       # one city
 
 The live Overpass download in the app is only an optional refresh.
 
-## Documentation — Metro Navigator (current)
+## Documentation — Metro Navigator
+
+**Current status:** [docs/Metro_Navigator_POC_What_Works.pdf](docs/Metro_Navigator_POC_What_Works.pdf)
+(what works, what cannot be achieved, edge cases measured, steps before production).
+
+**Outdated:** the documents below and `docs/Metro_Navigator_Code_Flow_Guide.pdf` still describe the
+self-learning Wi-Fi / cell fingerprints, ride memory, Bluetooth beacons and step counting, all since
+removed.
 
 | Document | Formats |
 |---|---|
@@ -50,5 +57,5 @@ Regenerate DOCX/PDF after editing the Markdown: `pip install markdown && python3
 Earlier documents covering both apps (v1.0, before radio positioning and bundled data) remain
 in `docs/` for reference; for Metro Navigator the documents above supersede them.
 
-Status: code complete and simulation-tested; **validate on real underground rides before
-production** (HLD §12).
+Status: code complete and simulation-tested (390 simulated rides across 13 situations, plus road
+cases); **not yet validated on a real metro ride — do that before production**.

@@ -15,12 +15,15 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.testgpslocation.MainActivity
 import com.example.testgpslocation.engine.NavigationController
+import com.example.testgpslocation.engine.TestDriveMode
 import com.example.testgpslocation.utils.NetworkStatus
 import com.example.testgpslocation.utils.TelemetryLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -34,6 +37,8 @@ class LocationTrackerService : Service() {
     private var lastNotificationMs = 0L
     private var started = false
     private var wakeLock: PowerManager.WakeLock? = null
+    /** Sends the position to Nemo Handy while there is no GPS (menu switch); null while switched off. */
+    private var handyFeed: HandyFeed? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -79,6 +84,7 @@ class LocationTrackerService : Service() {
                             p.truthLatitude, p.truthLongitude, p.errorMeters))
                     }
                     if (p.mock) append(" | MOCK LOCATION")
+                    if (handyFeed?.publishing == true) append(" | Sent to Handy")
                     p.sensors?.let { append(" | ").append(it) }
                 }
                 TelemetryLogger.log(
@@ -86,6 +92,12 @@ class LocationTrackerService : Service() {
                     p.speedMps.toFloat(), if (p.gpsAvailable) "Acquired" else "Lost", NetworkStatus.label(this@LocationTrackerService),
                     extra
                 )
+            }
+        }
+        scope.launch {
+            while (isActive) {
+                updateHandyFeed()
+                delay(HANDY_FEED_PERIOD_MS)
             }
         }
         scope.launch {
@@ -101,6 +113,25 @@ class LocationTrackerService : Service() {
                 updateNotification(text)
             }
         }
+    }
+
+    private fun updateHandyFeed() {
+        val on = HandyFeed.isWanted(this)
+        HandyFeed.enabled = on
+        if (!on) {
+            handyFeed?.shutdown()
+            handyFeed = null
+            return
+        }
+        val feed = handyFeed ?: HandyFeed(this).also { f ->
+            f.onEvent = { TelemetryLogger.logCustom(this, "EVENT: $it") }
+            handyFeed = f
+        }
+        val s = NavigationController.state.value
+        // A tunnel test needs the real GPS as its reference: the receiver must not be replaced then.
+        val tunnelTest = NavigationController.testDrive.value.mode == TestDriveMode.TUNNEL
+        feed.update(if (tunnelTest) s.copy(gpsAvailable = true) else s, NavigationController.satellites.value.usedInFix,
+            SystemClock.elapsedRealtime())
     }
 
     private fun updateNotification(text: String) {
@@ -137,6 +168,9 @@ class LocationTrackerService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        handyFeed?.shutdown() // never leave the phone's GPS replaced
+        handyFeed = null
+        HandyFeed.enabled = false
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         if (started) {
@@ -157,5 +191,7 @@ class LocationTrackerService : Service() {
         private const val NOTIFICATION_ID = 2001
         private const val CLIENT = "service"
         private const val MAX_WAKE_LOCK_MS = 12 * 60 * 60 * 1000L // safety cap: 12 h
+        /** Handy expects about one position a second, like a GPS receiver. */
+        private const val HANDY_FEED_PERIOD_MS = 1_000L
     }
 }

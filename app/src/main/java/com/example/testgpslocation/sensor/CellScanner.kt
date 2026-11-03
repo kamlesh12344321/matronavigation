@@ -18,21 +18,15 @@ import android.telephony.CellSignalStrengthNr
 import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.content.ContextCompat
-import com.example.testgpslocation.engine.RadioScan
 
 /**
- * Mobile-network front end: the serving and neighbour cells (4G, 5G, 3G, 2G) with their
- * received power, every [SCAN_INTERVAL_MS]. Metro tunnels are covered by in-tunnel antennas, so
- * which cells are heard, how strongly, and where the phone hands over between them repeat along
- * the line: learnt in the radio map, they place the train with no GPS, no Wi-Fi and no internet.
+ * The serving mobile cell (4G, 5G, 3G, 2G) and its received power, every [SCAN_INTERVAL_MS],
+ * for the log: the coverage along the route. Not used for positioning (cell-tower positions
+ * come from Google network location, which needs mobile data).
  * Needs precise location permission and location turned on (Android hides cells otherwise).
  * All callbacks on the main thread.
  */
 class CellScanner(context: Context) {
-
-    interface Listener {
-        fun onRadioScan(scan: RadioScan)
-    }
 
     private val appContext = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
@@ -40,17 +34,18 @@ class CellScanner(context: Context) {
         if (appContext.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY))
             appContext.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
         else null
-    private val builder = CellScanBuilder()
-
-    var listener: Listener? = null
     var isRunning = false
         private set
 
     /** The phone can read mobile cells at all (no SIM slot / telephony on tablets). */
     val available: Boolean get() = telephony != null
 
-    /** Strongest serving cell of the latest scan, for the log. */
-    val servingCell: CellReading? get() = builder.servingCell
+    /**
+     * Strongest serving cell of the latest scan for the log, as "tech:plmn:area:cell -85 dBm"
+     * (or "tech:pciN@channel …"); null when none is heard.
+     */
+    var servingCell: String? = null
+        private set
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -68,6 +63,7 @@ class CellScanner(context: Context) {
     fun stop() {
         if (!isRunning) return
         isRunning = false
+        servingCell = null
         handler.removeCallbacks(ticker)
     }
 
@@ -95,11 +91,11 @@ class CellScanner(context: Context) {
         try { tm.allCellInfo } catch (e: SecurityException) { null }
 
     private fun onCells(cells: List<CellInfo>?) {
-        if (!isRunning || cells.isNullOrEmpty()) return
+        if (!isRunning || cells == null) return // unknown (modem error): keep the last reading
         val now = SystemClock.elapsedRealtime()
         val readings = cells.filter { now - ageReferenceMs(it) <= MAX_AGE_MS }.mapNotNull(::readingOf)
-        if (readings.isEmpty()) return
-        listener?.onRadioScan(RadioScan(now, builder.build(readings, now)))
+        // With two SIMs both may be registered: the stronger one.
+        servingCell = readings.maxByOrNull { it.second }?.let { (key, dbm) -> "$key $dbm dBm" }
     }
 
     /** When the modem measured the cell, on the elapsed-realtime clock (ms). */
@@ -107,26 +103,27 @@ class CellScanner(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) cell.timestampMillis
         else @Suppress("DEPRECATION") (cell.timeStamp / 1_000_000L)
 
-    private fun readingOf(cell: CellInfo): CellReading? = try {
+    /** A serving (registered) cell as (key, received power in dBm); null for neighbours and odd readings. */
+    private fun readingOf(cell: CellInfo): Pair<String, Int>? = if (!cell.isRegistered) null else try {
         when {
             cell is CellInfoLte -> {
                 val id = cell.cellIdentity
                 val dbm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) cell.cellSignalStrength.rsrp else cell.cellSignalStrength.dbm
-                reading("lte", plmn(id), id.tac, id.ci.toLong(), id.pci, id.earfcn, dbm, cell.isRegistered)
+                reading("lte", plmn(id), id.tac, id.ci.toLong(), id.pci, id.earfcn, dbm)
             }
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && cell is CellInfoNr -> {
                 val id = cell.cellIdentity as CellIdentityNr
                 val ss = cell.cellSignalStrength as CellSignalStrengthNr
                 val dbm = if (ss.ssRsrp != CellInfo.UNAVAILABLE) ss.ssRsrp else ss.csiRsrp
-                reading("nr", plmnOf(id.mccString, id.mncString), id.tac, id.nci, id.pci, id.nrarfcn, dbm, cell.isRegistered)
+                reading("nr", plmnOf(id.mccString, id.mncString), id.tac, id.nci, id.pci, id.nrarfcn, dbm)
             }
             cell is CellInfoWcdma -> {
                 val id = cell.cellIdentity
-                reading("wcdma", plmn(id), id.lac, id.cid.toLong(), id.psc, id.uarfcn, cell.cellSignalStrength.dbm, cell.isRegistered)
+                reading("wcdma", plmn(id), id.lac, id.cid.toLong(), id.psc, id.uarfcn, cell.cellSignalStrength.dbm)
             }
             cell is CellInfoGsm -> {
                 val id = cell.cellIdentity
-                reading("gsm", plmn(id), id.lac, id.cid.toLong(), id.bsic, id.arfcn, cell.cellSignalStrength.dbm, cell.isRegistered)
+                reading("gsm", plmn(id), id.lac, id.cid.toLong(), id.bsic, id.arfcn, cell.cellSignalStrength.dbm)
             }
             else -> null // CDMA / TD-SCDMA: not used on Indian metro networks
         }
@@ -134,15 +131,15 @@ class CellScanner(context: Context) {
         null // a modem reporting odd values must not stop the scan
     }
 
-    private fun reading(tech: String, plmn: String?, area: Int, cellId: Long, pci: Int, channel: Int, dbm: Int, registered: Boolean): CellReading? {
+    private fun reading(tech: String, plmn: String?, area: Int, cellId: Long, pci: Int, channel: Int, dbm: Int): Pair<String, Int>? {
         if (dbm == UNAVAILABLE || dbm !in MIN_DBM..MAX_DBM) return null
         val globalId = plmn != null && area != UNAVAILABLE && cellId != UNAVAILABLE.toLong() && cellId != UNAVAILABLE_LONG && cellId >= 0
         val key = when {
-            globalId -> "${CellScanBuilder.CELL_PREFIX}$tech:$plmn:$area:$cellId"
-            pci != UNAVAILABLE && channel != UNAVAILABLE -> "${CellScanBuilder.CELL_PREFIX}$tech:pci$pci@$channel"
+            globalId -> "$tech:$plmn:$area:$cellId"
+            pci != UNAVAILABLE && channel != UNAVAILABLE -> "$tech:pci$pci@$channel"
             else -> return null
         }
-        return CellReading(key, dbm, registered)
+        return key to dbm
     }
 
     private fun plmn(id: android.telephony.CellIdentityLte): String? =

@@ -1,16 +1,12 @@
 package com.example.testgpslocation.engine
 
 import com.example.testgpslocation.models.GpsPoint
-import com.example.testgpslocation.sensor.CellReading
-import com.example.testgpslocation.sensor.CellScanBuilder
 import com.example.testgpslocation.utils.GeoToolbox
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.ln
-import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
@@ -27,9 +23,8 @@ import kotlin.random.Random
  *
  * Phone: world-frame accelerometer = tangential + centripetal acceleration, rotated by a
  * compass error (magnetic disturbance), plus bias and noise. GPS only until the tunnel
- * portal (optional); the watchdog reports the loss 6 s after the last fix. Radio: Wi-Fi access
- * points on platforms, log-distance path loss with noise, scanned every 30 s like RadioScanner;
- * and/or one in-tunnel mobile cell per station, scanned every 5 s like CellScanner.
+ * portal (optional); the watchdog reports the loss 6 s after the last fix. No network or radio
+ * underground: the sensors and the line data alone.
  */
 object TunnelWorld {
     const val M_PER_DEG = 111_195.0
@@ -64,67 +59,6 @@ object TunnelWorld {
     }
 }
 
-/**
- * Radio along the line: Wi-Fi access points on platforms (log-distance path loss) and/or one
- * in-tunnel mobile cell per station (strongest at the platform, fading 40 dB/km into the tunnel,
- * so the phone hands over near mid-tunnel).
- */
-class RadioWorld(route: MetroRoute, val wifi: Boolean = true, val cells: Boolean = false) {
-    private data class Tx(val key: String, val lat: Double, val lon: Double, val power: Double, val exponent: Double)
-    private val txs = mutableListOf<Tx>()
-
-    init {
-        fun place(key: String, along: Double, lateral: Double, power: Double, n: Double) {
-            val p = route.pointAt(along.coerceIn(0.0, route.length))
-            val b = route.bearingAt(along.coerceIn(0.0, route.length), 1) + 90.0
-            val (lat, lon) = GeoToolbox.moveLocation(p.lat, p.lon, lateral, b)
-            txs += Tx(key, lat, lon, power, n)
-        }
-        TunnelWorld.stationDistances.forEachIndexed { i, d ->
-            listOf(-40.0, 0.0, 40.0).forEachIndexed { k, off -> place("wifi:ap-$i-$k", d + off, 8.0, -35.0, 2.7) }
-        }
-    }
-
-    /** Received power of station [i]'s cell at track distance [s], without fading. */
-    fun cellPower(i: Int, s: Double): Double = CELL_PEAK_DBM - CELL_FADE_DB_PER_M * abs(s - TunnelWorld.stationDistances[i])
-
-    /**
-     * Cells heard at track distance [s]: the serving one (strongest, kept until another is
-     * [HANDOVER_HYSTERESIS_DB] stronger) by its global id, the others by PCI. Returns the new serving cell too.
-     */
-    fun hearCells(s: Double, serving: Int, gauss: () -> Double): Pair<List<CellReading>, Int> {
-        val clean = TunnelWorld.stationDistances.indices.map { cellPower(it, s) }
-        val best = clean.indices.maxByOrNull { clean[it] }!!
-        val now = if (serving < 0 || clean[best] > clean[serving] + HANDOVER_HYSTERESIS_DB) best else serving
-        val readings = clean.indices.mapNotNull { i ->
-            val dbm = (clean[i] + gauss() * 3.0).roundToInt()
-            when {
-                dbm < -120 -> null
-                i == now -> CellReading("cell:lte:40445:7:${1000 + i}", dbm, registered = true)
-                else -> CellReading("cell:lte:pci${100 + i}@1650", dbm, registered = false)
-            }
-        }
-        return readings to now
-    }
-
-    fun hear(lat: Double, lon: Double, gauss: () -> Double): Map<String, Int> {
-        if (!wifi) return emptyMap()
-        val out = HashMap<String, Int>()
-        for (t in txs) {
-            val d = max(1.0, GeoToolbox.calculateDistance(lat, lon, t.lat, t.lon))
-            val rssi = t.power - 10 * t.exponent * log10(d) + gauss() * 3.0
-            if (rssi >= -95) out[t.key] = rssi.toInt()
-        }
-        return out
-    }
-
-    companion object {
-        const val CELL_PEAK_DBM = -72.0
-        const val CELL_FADE_DB_PER_M = 0.04
-        const val HANDOVER_HYSTERESIS_DB = 3.0
-    }
-}
-
 data class SimConfig(
     val cruise: Double = 22.0,
     /**
@@ -152,10 +86,11 @@ data class SimConfig(
     /** Inject a 4 s "still" reading every this many seconds of steady cruising. */
     val falseStillEverySec: Double? = null,
     val jiggleAtStations: Boolean = false,
-    val radio: RadioWorld? = null,
-    val radioMap: RadioMap? = null,
-    /** Memory of earlier rides (segment speeds); null = first ride ever. */
-    val rideMemory: RideMemory? = null,
+    /**
+     * Air-conditioning / compressors at platforms: the phone's fixed still rule never says
+     * "still"; only the vibration (0.05 standing vs 0.25 running) shows the stop.
+     */
+    val stillReadsMoving: Boolean = false,
     /** Gyroscope turn rate available (noise 0.3 °/s, bias 0.05 °/s). */
     val gyro: Boolean = true,
     val gyroNoiseDps: Double = 0.3,
@@ -181,25 +116,36 @@ data class SimResult(
     /** Longest time the estimated position stayed exactly the same (stops included). */
     val longestRepeatSec: Double = 0.0,
     /** Longest time the estimate stayed the same while the real train was moving. */
-    val longestRepeatWhileMovingSec: Double = 0.0
+    val longestRepeatWhileMovingSec: Double = 0.0,
+    /**
+     * Seconds in which the estimate kept moving while the real train stood, counted from
+     * [STOP_SETTLE_SEC] into each stop (the stop must first be recognised). A single jump — the
+     * snap onto the station, or a correction — is not movement and is not counted.
+     */
+    val movedWhileStoppedSec: Double = 0.0
 ) {
     val maxMovingError get() = movingErrors.maxOrNull() ?: 0.0
     val meanMovingError get() = if (movingErrors.isEmpty()) 0.0 else movingErrors.average()
     fun summary(name: String) = String.format(java.util.Locale.US,
-        "SIM %s: stops=%s stopErr(max)=%.1f m dwellErr(max)=%.1f m moving err mean=%.0f max=%.0f m speedRMS=%.2f m/s stillAtDwell=%.0f%% dirOK=%d/%d repeat(max)=%.0f s repeatWhileMoving(max)=%.1f s",
+        "SIM %s: stops=%s stopErr(max)=%.1f m dwellErr(max)=%.1f m moving err mean=%.0f max=%.0f m speedRMS=%.2f m/s stillAtDwell=%.0f%% dirOK=%d/%d repeat(max)=%.0f s repeatWhileMoving(max)=%.1f s movedWhileStopped=%.1f s",
         name, stationsAtStops, stopErrors.maxOrNull() ?: 0.0, dwellMaxError, meanMovingError, maxMovingError, speedRmsError,
-        zeroSpeedDwellFraction * 100, directionCorrectAtStops, stopsMeasured, longestRepeatSec, longestRepeatWhileMovingSec)
+        zeroSpeedDwellFraction * 100, directionCorrectAtStops, stopsMeasured, longestRepeatSec, longestRepeatWhileMovingSec, movedWhileStoppedSec)
+
+    companion object {
+        /** A stop is recognised within ~1–2 s and snapped to its station 5 s later. */
+        const val STOP_SETTLE_SEC = 7.0
+    }
 }
 
 class TunnelSimulator(private val cfg: SimConfig) {
     private val route = TunnelWorld.route
     private val rnd = Random(cfg.seed)
+    /** Separate stream, so adding vibration leaves every other noise sequence unchanged. */
+    private val vibRnd = Random(cfg.seed + 7)
     private fun gauss(): Double { val u = rnd.nextDouble().coerceAtLeast(1e-12); return sqrt(-2 * ln(u)) * cos(2 * Math.PI * rnd.nextDouble()) }
 
     fun run(): SimResult {
         val nav = UndergroundNavigator()
-        cfg.radioMap?.let { nav.radioMap = it }
-        cfg.rideMemory?.let { nav.rideMemory = it }
         if (cfg.setRouteBeforeStart) nav.setRoute(cfg.navigatorRoute ?: route)
         val dir = if (cfg.endStation >= cfg.startStation) 1 else -1
         val sd = TunnelWorld.stationDistances
@@ -229,10 +175,6 @@ class TunnelSimulator(private val cfg: SimConfig) {
         var lostReported = false
         var cruiseSeconds = 0.0
         var falseStillLeft = 0.0
-        var nextWifiMs = clock + 3_000L
-        var nextCellMs = clock + 1_000L
-        var servingCell = -1
-        val cellBuilder = CellScanBuilder()
 
         val events = mutableListOf<String>()
         val seen = mutableListOf<String>(); val expected = mutableListOf<String>()
@@ -246,6 +188,8 @@ class TunnelSimulator(private val cfg: SimConfig) {
         var lastEstLat = Double.NaN; var lastEstLon = Double.NaN
         var repeatSec = 0.0; var repeatMax = 0.0
         var repeatMovingSec = 0.0; var repeatMovingMax = 0.0
+        var movedStopped = 0.0
+        var changedLast = false
 
         if (!gpsOn && cfg.entranceFix) {
             // A fix at the station entrance, then down the stairs.
@@ -324,6 +268,9 @@ class TunnelSimulator(private val cfg: SimConfig) {
                 falseStillLeft -= dt
                 stillFor += 100
                 state = if (stillFor >= 1000) MotionState.STATIONARY else MotionState.MOVING
+            } else if (v == 0.0 && !jiggle && cfg.stillReadsMoving) {
+                stillFor = 0
+                state = MotionState.MOVING
             } else if (v == 0.0 && !jiggle) {
                 stillFor += 100
                 state = if (stillFor >= 1000) MotionState.STATIONARY else MotionState.MOVING
@@ -332,24 +279,10 @@ class TunnelSimulator(private val cfg: SimConfig) {
                 state = MotionState.MOVING
                 if (jiggle) { east = gauss() * 1.2; north = gauss() * 1.2; yaw = gauss() * 40.0 } // hand motion, zero mean
             }
+            val vibration = if (v > 0.0 || jiggle) 0.25 + 0.03 * vibRnd.nextDouble() else 0.05 + 0.01 * vibRnd.nextDouble()
             nav.onMotion(MotionSample(clock, dt, state, if (state == MotionState.STATIONARY) stillFor else 0, east, north,
-                orientationKnown = cfg.orientationKnown, yawRateDps = if (cfg.gyro) yaw else Double.NaN))
+                orientationKnown = cfg.orientationKnown, yawRateDps = if (cfg.gyro) yaw else Double.NaN, vibration = vibration))
 
-            // Radio (only underground: above ground GPS is better and learning uses it)
-            cfg.radio?.let { world ->
-                if (world.wifi && clock >= nextWifiMs) {
-                    nextWifiMs = clock + 30_000
-                    val wifi = world.hear(truth.lat, truth.lon, ::gauss)
-                    if (wifi.isNotEmpty()) nav.onRadioScan(RadioScan(clock, wifi))
-                }
-                if (world.cells && clock >= nextCellMs) {
-                    nextCellMs = clock + 5_000
-                    val (readings, serving) = world.hearCells(s, servingCell, ::gauss)
-                    servingCell = serving
-                    val signals = cellBuilder.build(readings, clock)
-                    if (signals.isNotEmpty()) nav.onRadioScan(RadioScan(clock, signals))
-                }
-            }
             events += nav.events; nav.events.clear()
 
             // Metrics, once GPS is gone
@@ -357,12 +290,15 @@ class TunnelSimulator(private val cfg: SimConfig) {
             val est = nav.state()
             if (est.source == PositionSource.NONE) continue
             val err = GeoToolbox.calculateDistance(est.latitude, est.longitude, truth.lat, truth.lon)
-            if (est.latitude == lastEstLat && est.longitude == lastEstLon) {
+            val changed = !(est.latitude == lastEstLat && est.longitude == lastEstLon)
+            if (!changed) {
                 repeatSec += dt; repeatMax = max(repeatMax, repeatSec)
                 if (v > 0.5) { repeatMovingSec += dt; repeatMovingMax = max(repeatMovingMax, repeatMovingSec) }
             } else {
                 repeatSec = 0.0; repeatMovingSec = 0.0
+                if (changedLast && dwelling && dwellElapsed >= SimResult.STOP_SETTLE_SEC) movedStopped += dt
             }
+            changedLast = changed && !lastEstLat.isNaN()
             lastEstLat = est.latitude; lastEstLon = est.longitude
             if (v > 0) {
                 movingErrors += err
@@ -392,6 +328,6 @@ class TunnelSimulator(private val cfg: SimConfig) {
         return SimResult(seen, expected, stopErrors, dwellMaxErr, movingErrors,
             if (speedN == 0) 0.0 else sqrt(speedSq / speedN),
             if (dwellSamples == 0) 1.0 else dwellZero.toDouble() / dwellSamples,
-            dirOk, measured, events, nav, repeatMax, repeatMovingMax)
+            dirOk, measured, events, nav, repeatMax, repeatMovingMax, movedStopped)
     }
 }

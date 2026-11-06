@@ -15,7 +15,7 @@ import kotlin.random.Random
  * Train: accelerates at 1.0 m/s², cruises, brakes at 1.0 m/s² into each station, dwells 25 s.
  * IMU: world-frame acceleration rotated by a compass error (magnetic disturbance in trains)
  * plus Gaussian noise. GPS: 1 Hz, 4 m noise, lost at a tunnel portal; the watchdog reports
- * the loss 6 s later. Optional network fixes underground.
+ * the loss 3 s later. Optional network fixes underground.
  */
 class RideSimulationTest {
 
@@ -110,7 +110,7 @@ class RideSimulationTest {
                     elapsedRealtimeMs = clock, isGnss = true), clock)
                 lastGpsMs = clock
             }
-            if (!gpsOn && !lostReported && clock - lastGpsMs >= 6000) {
+            if (!gpsOn && !lostReported && clock - lastGpsMs >= 3000) {
                 nav.onGpsLost(clock); lostReported = true
             }
             // --- network (only without GPS)

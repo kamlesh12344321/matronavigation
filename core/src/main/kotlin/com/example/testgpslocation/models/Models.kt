@@ -20,5 +20,8 @@ data class GpsPoint(
     val hasBearing: Boolean = false,
     val elapsedRealtimeMs: Long = 0L,
     val isGnss: Boolean = true,
-    val isMock: Boolean = false
+    val isMock: Boolean = false,
+    val altitudeMeters: Double? = null,
+    /** From the GPS provider but with no satellite in use: the phone chip's own estimate. */
+    val isChipEstimate: Boolean = false
 )

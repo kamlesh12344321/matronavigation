@@ -22,7 +22,6 @@ import androidx.core.content.ContextCompat
 import com.example.testgpslocation.engine.MotionSample
 import com.example.testgpslocation.engine.MotionState
 import com.example.testgpslocation.models.GpsPoint
-import com.example.testgpslocation.service.HandyFeed
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.location.FusedLocationProviderClient
@@ -31,7 +30,7 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
-import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.sqrt
 
 /** What this phone can do; shown to the user when something important is missing. */
@@ -41,8 +40,7 @@ data class DeviceCapabilities(
     val hasLinearAcceleration: Boolean,
     val hasAccelerometer: Boolean,
     val hasRotationVector: Boolean,
-    val hasGyroscope: Boolean,
-    val hasBarometer: Boolean
+    val hasGyroscope: Boolean
 )
 
 /**
@@ -52,13 +50,20 @@ data class DeviceCapabilities(
  *  - the satellite receiver (LocationManager GPS provider) → fixes marked isGnss = true;
  *  - Google fused location (cell / Wi-Fi / GPS mix) → isGnss = false, used when there is no
  *    satellite fix (e.g. underground with network);
- *  - without Google Play services: the platform network provider instead of fused.
+ *  - the platform network provider as the backup: used while fused sends nothing;
+ *  - with no position at all once GPS counts as lost, the phone's last known location.
+ * A GPS provider fix with no satellite in use is the chip's own estimate, not a satellite fix
+ * (an S24 sent them for 50 s claiming ±5 m): marked isChipEstimate, isGnss = false. See
+ * [ChipEstimateCheck].
  * "GPS lost" fires when no satellite fix arrived for [GPS_TIMEOUT_MS]; the navigator also treats
  * a run of only poor fixes as lost.
  *
  * Motion: one [MotionSample] every [SAMPLE_PERIOD_MS] with world-frame acceleration and a
  * stationary / walking / moving classification. Falls back to the raw accelerometer (gravity
  * removed with a low-pass filter) on phones without a linear-acceleration sensor.
+ *
+ * Barometer: height change since the sensors started, for the log only (position never uses it).
+ * Steps: the phone's own step detector, for following someone on foot without GPS.
  */
 class SensorHub(context: Context) : SensorEventListener {
 
@@ -67,6 +72,7 @@ class SensorHub(context: Context) : SensorEventListener {
         fun onGpsLost(elapsedMs: Long)
         fun onMotionSample(sample: MotionSample)
         fun onSatellites(inView: Int, usedInFix: Int) {}
+        fun onLastKnownFix(point: GpsPoint) {}
     }
 
     private val appContext = context.applicationContext
@@ -93,8 +99,7 @@ class SensorHub(context: Context) : SensorEventListener {
         hasLinearAcceleration = linearAccel != null,
         hasAccelerometer = rawAccel != null,
         hasRotationVector = rotationVector != null,
-        hasGyroscope = gyroscope != null,
-        hasBarometer = pressure != null
+        hasGyroscope = gyroscope != null
     )
 
     var listener: Listener? = null
@@ -102,6 +107,9 @@ class SensorHub(context: Context) : SensorEventListener {
 
     private var lastGnssFixMs = 0L
     private var gpsLostReported = false
+    private val chipCheck = ChipEstimateCheck()
+    private var lastFusedFixMs = 0L
+    private var stepSensorOn = false
     private var startedAtMs = 0L
 
     // Orientation (device -> world)
@@ -115,6 +123,7 @@ class SensorHub(context: Context) : SensorEventListener {
     private var sumEast = 0.0
     private var sumNorth = 0.0
     private var windowCount = 0
+    private var stepsInWindow = 0
 
     // Rolling buffers for classification
     private val accelMagnitudes = RingBuffer(ROLLING_SAMPLES)
@@ -124,9 +133,12 @@ class SensorHub(context: Context) : SensorEventListener {
     private var yawSum = 0.0
     private var yawCount = 0
 
-    // Pressure: rapid change over a few seconds (stairs / escalator into a station)
-    private val pressureHistory = ArrayDeque<Pair<Long, Float>>()
-    private var pressureRapidChange = false
+    /** Steps since the sensors started. */
+    var stepCount = 0; private set
+
+    // Barometer: height change since the sensors started (metres), null without a barometer
+    private var startHeightMeters = Float.NaN
+    var heightChangeMeters: Double? = null; private set
 
     private val gpsWatchdog = object : Runnable {
         override fun run() {
@@ -135,13 +147,17 @@ class SensorHub(context: Context) : SensorEventListener {
             if (!gpsLostReported && now - reference > GPS_TIMEOUT_MS) {
                 gpsLostReported = true
                 listener?.onGpsLost(now)
+                if (lastGnssFixMs == 0L) offerLastKnown()
             }
             handler.postDelayed(this, 1000L)
         }
     }
 
     private val gnssListener = object : LocationListener {
-        override fun onLocationChanged(location: Location) = deliver(location, isGnss = true)
+        override fun onLocationChanged(location: Location) {
+            val estimate = chipCheck.isEstimate(isMock(location), SystemClock.elapsedRealtime())
+            deliver(location, isGnss = !estimate, chipEstimate = estimate)
+        }
         override fun onProviderEnabled(provider: String) {}
         override fun onProviderDisabled(provider: String) {}
         @Deprecated("Deprecated in Java")
@@ -149,7 +165,10 @@ class SensorHub(context: Context) : SensorEventListener {
     }
 
     private val networkListener = object : LocationListener {
-        override fun onLocationChanged(location: Location) = deliver(location, isGnss = false)
+        override fun onLocationChanged(location: Location) {
+            // The backup: fused normally gives the same position, more often.
+            if (SystemClock.elapsedRealtime() - lastFusedFixMs > FUSED_SILENT_MS) deliver(location, isGnss = false)
+        }
         override fun onProviderEnabled(provider: String) {}
         override fun onProviderDisabled(provider: String) {}
         @Deprecated("Deprecated in Java")
@@ -158,8 +177,12 @@ class SensorHub(context: Context) : SensorEventListener {
 
     private val fusedCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
-            // Without a satellite receiver, very accurate fused fixes are the best we have.
-            result.lastLocation?.let { deliver(it, isGnss = !hasGnss && it.accuracy <= NO_GNSS_TRUSTED_ACCURACY) }
+            lastFusedFixMs = SystemClock.elapsedRealtime()
+            result.lastLocation?.let {
+                val echo = chipCheck.estimatesRunning(lastFusedFixMs)
+                // Without a satellite receiver, very accurate fused fixes are the best we have.
+                deliver(it, isGnss = !echo && !hasGnss && it.accuracy <= NO_GNSS_TRUSTED_ACCURACY, chipEstimate = echo)
+            }
         }
     }
 
@@ -167,12 +190,8 @@ class SensorHub(context: Context) : SensorEventListener {
         override fun onSatelliteStatusChanged(status: GnssStatus) {
             var used = 0
             for (i in 0 until status.satelliteCount) if (status.usedInFix(i)) used++
+            chipCheck.onSatelliteStatus(used, SystemClock.elapsedRealtime())
             listener?.onSatellites(status.satelliteCount, used)
-        }
-
-        // The receiver is off (e.g. while the Handy feed replaces it): no satellites, not the last count.
-        override fun onStopped() {
-            listener?.onSatellites(0, 0)
         }
     }
 
@@ -191,6 +210,12 @@ class SensorHub(context: Context) : SensorEventListener {
         startedAtMs = SystemClock.elapsedRealtime()
         gpsLostReported = false
         lastGnssFixMs = 0L
+        startHeightMeters = Float.NaN
+        heightChangeMeters = null
+        chipCheck.reset()
+        lastFusedFixMs = 0L
+        stepCount = 0
+        stepsInWindow = 0
 
         if (fine && hasGnss) {
             try {
@@ -206,24 +231,49 @@ class SensorHub(context: Context) : SensorEventListener {
             val request = LocationRequest.Builder(priority, FUSED_INTERVAL_MS).setMinUpdateIntervalMillis(FUSED_INTERVAL_MS / 2).build()
             try {
                 fused.requestLocationUpdates(request, fusedCallback, Looper.getMainLooper())
-                    .addOnFailureListener { e -> Log.w(TAG, "Fused location failed, using network provider", e); startNetworkProvider() }
+                    .addOnFailureListener { e -> Log.w(TAG, "Fused location failed", e) }
             } catch (e: Exception) {
                 Log.w(TAG, "Fused location unavailable", e)
-                startNetworkProvider()
             }
-        } else {
-            startNetworkProvider()
         }
+        startNetworkProvider()
 
         val accelSensor = linearAccel ?: rawAccel
         accelSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         gyroscope?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         pressure?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler) }
+        ensureStepSensor()
         handler.postDelayed(gpsWatchdog, 1000L)
         isRunning = true
         return true
     }
+
+    /** Also called when the permission may have been granted in Settings while running. */
+    fun ensureStepSensor() {
+        if (stepSensorOn || !hasStepPermission(appContext)) return
+        val sensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR) ?: return
+        stepSensorOn = sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME, handler)
+    }
+
+    /** No GPS and nothing else yet: where the phone last was, however it knew. */
+    @SuppressLint("MissingPermission")
+    private fun offerLastKnown() {
+        listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+            .mapNotNull { try { locationManager.getLastKnownLocation(it) } catch (_: Exception) { null } }
+            .maxByOrNull { it.elapsedRealtimeNanos }?.let(::deliverLastKnown)
+        try { fusedClient?.lastLocation?.addOnSuccessListener { it?.let(::deliverLastKnown) } } catch (_: Exception) {}
+    }
+
+    private fun deliverLastKnown(loc: Location) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - loc.elapsedRealtimeNanos / 1_000_000 > LAST_KNOWN_MAX_AGE_MS) return
+        listener?.onLastKnownFix(GpsPoint(loc.latitude, loc.longitude, max(loc.accuracy, LAST_KNOWN_MIN_ACCURACY), loc.time,
+            elapsedRealtimeMs = now, isGnss = false, isMock = isMock(loc)))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isMock(loc: Location) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) loc.isMock else loc.isFromMockProvider
 
     @SuppressLint("MissingPermission")
     private fun startNetworkProvider() {
@@ -245,24 +295,26 @@ class SensorHub(context: Context) : SensorEventListener {
         sensorManager.unregisterListener(this)
         handler.removeCallbacks(gpsWatchdog)
         isRunning = false
+        stepSensorOn = false
         windowStartMs = 0L
         stillSinceMs = 0L
     }
+
+    /** Off, the phone cannot use Wi-Fi or mobile towers at all (Google Location Accuracy). */
+    fun isNetworkLocationEnabled(): Boolean = try {
+        !locationManager.allProviders.contains(LocationManager.NETWORK_PROVIDER) || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+    } catch (_: Exception) { true }
 
     fun isLocationEnabled(): Boolean = try {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) locationManager.isLocationEnabled
         else locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
     } catch (_: Exception) { true }
 
-    private fun deliver(loc: Location, isGnss: Boolean) {
+    private fun deliver(loc: Location, isGnss: Boolean, chipEstimate: Boolean = false) {
         val now = SystemClock.elapsedRealtime()
         // Stale fixes (e.g. a cached "last location" delivered late) are ignored.
         val fixElapsed = loc.elapsedRealtimeNanos / 1_000_000
         if (fixElapsed > 0 && now - fixElapsed > STALE_FIX_MS) return
-        @Suppress("DEPRECATION")
-        val mock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) loc.isMock else loc.isFromMockProvider
-        // While the Handy feed is on, mock fixes are this app's own position coming back: not GPS.
-        if (mock && HandyFeed.enabled) return
         if (isGnss) {
             lastGnssFixMs = now
             gpsLostReported = false
@@ -271,7 +323,8 @@ class SensorHub(context: Context) : SensorEventListener {
             GpsPoint(
                 latitude = loc.latitude,
                 longitude = loc.longitude,
-                accuracy = if (loc.hasAccuracy()) loc.accuracy else 999f,
+                // An estimate's claimed accuracy means nothing: it even improved as satellites vanished.
+                accuracy = (if (loc.hasAccuracy()) loc.accuracy else 999f).let { if (chipEstimate) max(it, CHIP_ESTIMATE_MIN_ACCURACY) else it },
                 timestamp = loc.time,
                 speedMeterPerSecond = if (loc.hasSpeed()) loc.speed else 0f,
                 bearingDegree = if (loc.hasBearing()) loc.bearing else 0f,
@@ -279,7 +332,9 @@ class SensorHub(context: Context) : SensorEventListener {
                 hasBearing = loc.hasBearing(),
                 elapsedRealtimeMs = if (fixElapsed > 0) fixElapsed else now,
                 isGnss = isGnss,
-                isMock = mock
+                isMock = isMock(loc),
+                altitudeMeters = if (loc.hasAltitude()) loc.altitude else null,
+                isChipEstimate = chipEstimate
             )
         )
     }
@@ -309,6 +364,7 @@ class SensorHub(context: Context) : SensorEventListener {
                 }
             }
             Sensor.TYPE_PRESSURE -> onPressure(event.values[0])
+            Sensor.TYPE_STEP_DETECTOR -> { stepsInWindow++; stepCount++ }
         }
     }
 
@@ -336,14 +392,15 @@ class SensorHub(context: Context) : SensorEventListener {
             stationaryForMs = if (stillSinceMs == 0L) 0L else now - stillSinceMs,
             accelEast = if (windowCount > 0) sumEast / windowCount else 0.0,
             accelNorth = if (windowCount > 0) sumNorth / windowCount else 0.0,
-            pressureRapidChange = pressureRapidChange,
             orientationKnown = hasRotation,
             // Bearing rate: clockwise positive, degrees per second.
             yawRateDps = if (yawCount > 0) -Math.toDegrees(yawSum / yawCount) else Double.NaN,
-            vibration = accelMagnitudes.std() ?: Double.NaN
+            vibration = accelMagnitudes.std() ?: Double.NaN,
+            steps = stepsInWindow,
+            heightMeters = heightChangeMeters ?: Double.NaN
         )
         windowStartMs = now; sumEast = 0.0; sumNorth = 0.0; windowCount = 0
-        yawSum = 0.0; yawCount = 0
+        yawSum = 0.0; yawCount = 0; stepsInWindow = 0
         listener?.onMotionSample(sample)
     }
 
@@ -354,7 +411,9 @@ class SensorHub(context: Context) : SensorEventListener {
         // Shaking far beyond any vehicle: the phone (or its box) is being carried.
         val walking = accelStd > WALKING_ACCEL_STD
         val stillThreshold = if (linearAccel != null) STILL_ACCEL_STD else STILL_ACCEL_STD_RAW
-        val still = !walking && accelStd < stillThreshold && (gyroscope == null || gyroMean < STILL_GYRO_MEAN)
+        // A smooth pull-away is a steady push with little shaking: the mean shows it, the spread does not.
+        val still = !walking && accelStd < stillThreshold && accelMagnitudes.mean() < STILL_ACCEL_MEAN &&
+            (gyroscope == null || gyroMean < STILL_GYRO_MEAN)
         if (still) { if (stillSinceMs == 0L) stillSinceMs = now } else stillSinceMs = 0L
         return when {
             walking -> MotionState.WALKING
@@ -365,10 +424,9 @@ class SensorHub(context: Context) : SensorEventListener {
 
     private fun onPressure(hPa: Float) {
         if (hPa.isNaN() || hPa <= 0f) return
-        val now = SystemClock.elapsedRealtime()
-        pressureHistory.addLast(now to hPa)
-        while (pressureHistory.isNotEmpty() && now - pressureHistory.first().first > PRESSURE_WINDOW_MS) pressureHistory.removeFirst()
-        pressureRapidChange = abs(hPa - pressureHistory.first().second) > PRESSURE_RAPID_DELTA_HPA
+        val height = SensorManager.getAltitude(SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hPa)
+        if (startHeightMeters.isNaN()) startHeightMeters = height
+        heightChangeMeters = (height - startHeightMeters).toDouble()
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -388,23 +446,65 @@ class SensorHub(context: Context) : SensorEventListener {
     }
 
     companion object {
+        fun hasStepPermission(context: Context) = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
+
         private const val TAG = "SensorHub"
         const val SAMPLE_PERIOD_MS = 100L
-        const val GPS_TIMEOUT_MS = 6_000L
+        const val GPS_TIMEOUT_MS = 3_000L
         private const val GNSS_INTERVAL_MS = 1_000L
         private const val FUSED_INTERVAL_MS = 2_000L
         /** A fix older than this describes where the phone was, not where it is (a 30 s old fix in a train is 300+ m off). */
         private const val STALE_FIX_MS = 10_000L
         private const val NO_GNSS_TRUSTED_ACCURACY = 25f
+        private const val CHIP_ESTIMATE_MIN_ACCURACY = 50f
+        /** Fused sent nothing for this long: the network provider takes over. */
+        private const val FUSED_SILENT_MS = 10_000L
+        private const val LAST_KNOWN_MIN_ACCURACY = 1_000f
+        private const val LAST_KNOWN_MAX_AGE_MS = 24 * 60 * 60 * 1000L
         private const val ROLLING_SAMPLES = 100 // ~2 s at SENSOR_DELAY_GAME (50 Hz)
         private const val MIN_SAMPLES_FOR_STD = 10
         private const val WALKING_ACCEL_STD = 1.2
         private const val STILL_ACCEL_STD = 0.06
         private const val STILL_ACCEL_STD_RAW = 0.09 // raw accelerometer is noisier
+        private const val STILL_ACCEL_MEAN = 0.3
         private const val STILL_GYRO_MEAN = 0.05
         private const val STILL_CONFIRM_MS = 1_000L
         private const val GRAVITY_ALPHA = 0.9f
-        private const val PRESSURE_WINDOW_MS = 10_000L
-        private const val PRESSURE_RAPID_DELTA_HPA = 0.4f
+    }
+}
+
+/**
+ * Tells a GPS provider fix from the chip's own estimate: a recent report says no satellite is in
+ * use, on a phone that does report them. Google fused repeats those estimates as good network
+ * fixes, so while they last fused fixes count as estimates too.
+ */
+class ChipEstimateCheck {
+    private var used = 0
+    private var satellitesReported = false // phones that never report them must keep working
+    private var statusAtMs = 0L
+    private var estimateAtMs = 0L
+
+    fun reset() {
+        used = 0; satellitesReported = false; statusAtMs = 0L; estimateAtMs = 0L
+    }
+
+    fun onSatelliteStatus(usedInFix: Int, nowMs: Long) {
+        used = usedInFix
+        statusAtMs = nowMs
+        if (usedInFix > 0) satellitesReported = true
+    }
+
+    /** For a GPS provider fix. A stale report says nothing, and a mock fix has nothing to do with the real satellites. */
+    fun isEstimate(mock: Boolean, nowMs: Long): Boolean {
+        val estimate = !mock && satellitesReported && used == 0 && nowMs - statusAtMs <= MAX_AGE_MS
+        if (estimate) estimateAtMs = nowMs
+        return estimate
+    }
+
+    fun estimatesRunning(nowMs: Long) = estimateAtMs != 0L && nowMs - estimateAtMs <= MAX_AGE_MS
+
+    private companion object {
+        const val MAX_AGE_MS = 3_000L
     }
 }

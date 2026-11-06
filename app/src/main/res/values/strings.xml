@@ -7,9 +7,6 @@
     <string name="flip_direction">Flip ⇄</string>
     <string name="start_logging">Start logging</string>
     <string name="stop_logging">Stop logging</string>
-    <string name="handy_feed">Send position to Nemo Handy</string>
-    <string name="handy_feed_on">Without GPS, this app\'s position becomes the phone\'s location for Nemo Handy (needs Developer options › Select mock location app › Metro Navigator)</string>
-    <string name="handy_feed_off">Nemo Handy gets only the real GPS again</string>
     <string name="auto_direction">Destination: auto (direction of travel)</string>
     <string name="permission_needed">Location permission is required</string>
     <string name="fix">Fix</string>

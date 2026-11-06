@@ -6,6 +6,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import kotlin.math.abs
 
 /** GPS / network / sensor edge cases on a straight north-bound line A..E (stations every ~1.1 km). */
 class EdgeCaseTest {
@@ -132,6 +133,77 @@ class EdgeCaseTest {
         }
     }
 
+    /** Standing, phone still: fixes jump about by ±3 m and report about 0.1 m/s, as real ones do. */
+    private fun standWithGps(fixes: Int, lat: Double, lon: Double, phone: () -> Unit) = repeat(fixes) { k ->
+        phone()
+        val noise = (if (k % 2 == 0) 3.0 else -3.0) / mPerDeg
+        gnss(lat + noise, lon = lon - noise, speed = 0.12f, dtMs = 100)
+    }
+
+    private fun driveThenStop(): Pair<Double, Double> {
+        repeat(30) { k -> repeat(9) { vibrating(0.40) }; gnss(12.90 + k * 10 / mPerDeg, speed = 10f, dtMs = 100) }
+        return nav.currentLat to nav.currentLon
+    }
+
+    @Test
+    fun gpsNoiseDoesNotMoveAStandingVehicle() {
+        val (lat, lon) = driveThenStop()
+        run(MotionState.STATIONARY, 2.0)
+        standWithGps(20, lat, lon) { run(MotionState.STATIONARY, 0.9) }
+        assertEquals(lat, nav.currentLat, 1e-9)
+        assertEquals(lon, nav.currentLon, 1e-9)
+        assertEquals(PositionSource.GPS, nav.state().source)
+    }
+
+    @Test
+    fun gpsNoiseAlsoStaysOutWhenAirConKeepsThePhoneReadingMoving() {
+        val (lat, lon) = driveThenStop()
+        repeat(20) { vibrating(0.05) } // standing: well below the running level of 0.40
+        standWithGps(20, lat, lon) { repeat(9) { vibrating(0.05) } }
+        assertEquals(lat, nav.currentLat, 1e-9)
+        assertEquals(lon, nav.currentLon, 1e-9)
+    }
+
+    @Test
+    fun aStandingVehicleFollowsGpsAgainTheMomentItMoves() {
+        val (lat, lon) = driveThenStop()
+        run(MotionState.STATIONARY, 2.0)
+        standWithGps(5, lat, lon) { run(MotionState.STATIONARY, 0.9) }
+        run(MotionState.MOVING, 0.9)
+        val movedLat = lat + 2.0 / mPerDeg
+        gnss(movedLat, lon = lon, speed = 1.5f, dtMs = 100)
+        assertEquals(movedLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aFixTooFarAwayToBeNoiseIsTakenEvenWhileStanding() {
+        val (lat, lon) = driveThenStop()
+        run(MotionState.STATIONARY, 2.0)
+        val farLat = lat + 40.0 / mPerDeg
+        gnss(farLat, lon = lon, speed = 0.1f, dtMs = 100)
+        assertEquals(farLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aMuchBetterFixReplacesAPoorPositionWhileStanding() {
+        run(MotionState.STATIONARY, 2.0)
+        gnss(12.90, speed = 0.1f, accuracy = 30f)
+        val betterLat = 12.90 + 8.0 / mPerDeg
+        gnss(betterLat, speed = 0.1f, accuracy = 4f)
+        assertEquals(betterLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aSlowVehicleIsFollowedWhileThePhoneFeelsItMoving() {
+        run(MotionState.MOVING, 2.0)
+        repeat(6) { i ->
+            val lat = 12.90 + i * 0.4 / mPerDeg
+            run(MotionState.MOVING, 0.9)
+            gnss(lat, speed = 0.4f, dtMs = 100)
+            assertEquals("fix $i", lat, nav.currentLat, 1e-9)
+        }
+    }
+
     @Test
     fun invalidFixesAreIgnored() {
         clock += 1000
@@ -190,10 +262,193 @@ class EdgeCaseTest {
         nav.setRoute(route)
         gnss(12.90000, speed = 20f); gnss(12.90018, speed = 20f)
         val lastFixLat = 12.90018
-        clock += 6000 // watchdog fires 6 s after the last fix
+        clock += 3000 // watchdog fires 3 s after the last fix
         nav.onGpsLost(clock)
         val advanced = (nav.state().latitude - lastFixLat) * mPerDeg
-        assertEquals(120.0, advanced, 5.0) // 20 m/s * 6 s
+        assertEquals(60.0, advanced, 5.0) // 20 m/s * 3 s
+    }
+
+    @Test
+    fun stepsInATrainDoNotMoveIt() {
+        nav.setRoute(route)
+        gnss(12.90000); gnss(12.90009); gnss(12.90018, speed = 6f) // a train, not a walker
+        gnss(12.90018, speed = 0f); gnss(12.90018, speed = 0f)
+        nav.onGpsLost(clock)
+        val startLat = nav.currentLat
+        repeat(300) { k ->
+            clock += 100
+            nav.onMotion(MotionSample(clock, 0.1, MotionState.WALKING, 0, 0.0, 0.0, steps = if (k % 6 == 0) 1 else 0))
+        }
+        assertEquals(startLat, nav.currentLat, 1e-9)
+    }
+
+    /** One 100 ms walking sample, a step every 600 ms. */
+    private fun stepping(k: Int) {
+        clock += 100
+        nav.onMotion(MotionSample(clock, 0.1, MotionState.WALKING, 0, 0.0, 0.0, orientationKnown = true, yawRateDps = 0.0,
+            vibration = 1.5, steps = if (k % 6 == 0) 1 else 0))
+    }
+
+    @Test
+    fun aWalkerBesideALineIsNotPulledOntoIt() {
+        nav.setRoute(route)
+        val lon = 77.0015 // about 160 m from the line: inside the radius a train is locked from
+        var lat = 12.90
+        repeat(30) { s ->
+            repeat(10) { k -> stepping(s * 10 + k) }
+            lat += 1.0 / mPerDeg
+            nav.onLocationFix(GpsPoint(lat, lon, 5f, clock, 1f, 0f, hasSpeed = true, hasBearing = true, elapsedRealtimeMs = clock, isGnss = true), clock)
+        }
+        nav.onGpsLost(clock)
+        val startLat = nav.currentLat
+        repeat(300) { k -> stepping(k) }
+        assertFalse(nav.state().onTrack)
+        assertEquals(lon, nav.currentLon, 1e-5)
+        assertTrue("walked ${(nav.currentLat - startLat) * mPerDeg} m", (nav.currentLat - startLat) * mPerDeg in 25.0..35.0)
+    }
+
+    @Test
+    fun aWalkerLockedToALineLeavesItAfterTenSteps() {
+        nav.setRoute(route)
+        gnss(12.90000, speed = 1f); gnss(12.900009, speed = 1f)
+        nav.onGpsLost(clock)
+        assertTrue(nav.state().onTrack)
+        repeat(100) { k -> stepping(k) }
+        assertFalse(nav.state().onTrack)
+    }
+
+    /** Riding north through the tunnel at [speed], the phone never reading still, the barometer at [height]. */
+    private fun riding(seconds: Double, speed: Double = 0.0, height: (Int) -> Double) {
+        repeat((seconds * 10).toInt()) { k ->
+            clock += 100
+            nav.onMotion(MotionSample(clock, 0.1, MotionState.MOVING, 0, 0.0, 0.0, orientationKnown = true, yawRateDps = 0.0,
+                vibration = 0.15, heightMeters = height(k)))
+        }
+    }
+
+    private fun cellFix(lat: Double, accuracy: Float) = nav.onLocationFix(GpsPoint(lat, 77.0, accuracy, clock, elapsedRealtimeMs = clock, isGnss = false), clock)
+
+    @Test
+    fun aMobileCellFixCannotThrowTheEstimateFar() {
+        rideIntoTunnel()
+        run(MotionState.MOVING, 10.0)
+        val before = nav.currentLat
+        clock += 1000
+        cellFix(before + 1500 / mPerDeg, 100f) // claims ±100 m, like the real ones that were 1.2 km off
+        assertTrue("moved ${(nav.currentLat - before) * mPerDeg} m", abs((nav.currentLat - before) * mPerDeg) < 50.0)
+    }
+
+    @Test
+    fun anOldFixRepeatedSaysNothingNew() {
+        rideIntoTunnel()
+        run(MotionState.MOVING, 10.0)
+        val lat = nav.currentLat + 100 / mPerDeg
+        cellFix(lat, 40f)
+        clock += 5000
+        assertEquals("ignored: repeat of the last fix", cellFix(lat, 240f))
+    }
+
+    @Test
+    fun goodFixesThatAgreeCorrectTheLine() {
+        rideIntoTunnel()
+        run(MotionState.MOVING, 10.0)
+        val truth = nav.currentLat + 1500 / mPerDeg // the estimate has fallen far behind
+        assertEquals("ignored: too far from the estimate", cellFix(truth, 60f))
+        clock += 5000
+        assertEquals("ignored: too far from the estimate", cellFix(truth + 0.00002, 45f))
+        clock += 5000
+        assertEquals("used: moved to it", cellFix(truth + 0.00004, 50f))
+        assertTrue("off by ${abs(nav.currentLat - truth) * mPerDeg} m", abs(nav.currentLat - truth) * mPerDeg < 20.0)
+    }
+
+    @Test
+    fun cellFixesThatAgreeDoNotCorrectTheLine() {
+        rideIntoTunnel()
+        run(MotionState.MOVING, 10.0)
+        val before = nav.currentLat
+        val wrong = before + 1800 / mPerDeg
+        repeat(4) { k -> clock += 5000; cellFix(wrong + k * 0.00002, 100f) }
+        assertTrue("moved to the cell", abs(nav.currentLat - wrong) * mPerDeg > 1000.0)
+    }
+
+    private fun standingAtStationBThenLeaving() {
+        nav.setRoute(route)
+        gnss(12.90000); gnss(12.90009); gnss(12.90018)
+        nav.onGpsLost(clock)
+        val b = route.stations[1]
+        var h = 0.0
+        while (nav.state().nextStation != b.name || abs(nav.currentLat - 12.91) * mPerDeg > 100.0) riding(1.0) { h += 0.05; h }
+    }
+
+    @Test
+    fun aSteadyPressureNearAStationIsAStopEvenInTheHand() {
+        standingAtStationBThenLeaving()
+        riding(15.0) { 2.0 }
+        assertTrue("events ${nav.events}", nav.events.any { it == "Stopped at B" })
+        assertEquals(0.0, nav.state().speedMps, 1e-9)
+    }
+
+    @Test
+    fun aStepInThePressureIsNotADeparture() {
+        standingAtStationBThenLeaving()
+        riding(15.0) { 2.0 }
+        riding(15.0) { 3.4 } // doors: one step, then steady again
+        assertEquals(0.0, nav.state().speedMps, 1e-9)
+    }
+
+    @Test
+    fun aPressureThatKeepsChangingIsADeparture() {
+        standingAtStationBThenLeaving()
+        riding(15.0) { 2.0 }
+        riding(12.0) { k -> 2.0 + k * 0.03 }
+        assertTrue("events ${nav.events}", nav.events.any { it == "Departure seen from the pressure" })
+        assertTrue(nav.state().speedMps > 3.0)
+    }
+
+    @Test
+    fun aSteadyPressureFarFromAnyStationIsNotAStop() {
+        nav.setRoute(route)
+        gnss(12.90400, speed = 10f); gnss(12.90409, speed = 10f); gnss(12.90418, speed = 10f) // midway A to B
+        nav.onGpsLost(clock)
+        riding(12.0) { 2.0 }
+        assertTrue("speed ${nav.state().speedMps}", nav.state().speedMps > 5.0)
+    }
+
+    @Test
+    fun aGpsJumpAtAStopDoesNotTurnTheDirectionRound() {
+        nav.setRoute(route)
+        gnss(12.90000); gnss(12.90009); gnss(12.90018)
+        val next = nav.state().nextStation
+        gnss(12.90018, speed = 0f); gnss(12.90018 - 30 / mPerDeg, speed = 0f) // reflected fix, 30 m back
+        assertEquals(next, nav.state().nextStation)
+    }
+
+    @Test
+    fun onlyPoorGpsCountsAsLostAfterThreeSeconds() {
+        gnss(12.90000); gnss(12.90009)
+        gnss(12.90018, accuracy = 80f, dtMs = 2500)
+        assertTrue("2.5 s of poor GPS is not lost yet", nav.state().gpsAvailable)
+        gnss(12.90027, accuracy = 80f, dtMs = 1000)
+        assertFalse("3.5 s of poor GPS is lost", nav.state().gpsAvailable)
+    }
+
+    @Test
+    fun gpsAltitudeIsReportedOnlyWhileGpsWorks() {
+        clock += 1000
+        nav.onLocationFix(GpsPoint(12.90, 77.0, 5f, clock, 10f, 0f, hasSpeed = true, hasBearing = true,
+            elapsedRealtimeMs = clock, isGnss = true, altitudeMeters = 912.5), clock)
+        assertEquals(912.5, nav.state().gpsAltitudeMeters!!, 0.001)
+        nav.onGpsLost(clock + 3000)
+        assertEquals(null, nav.state().gpsAltitudeMeters)
+    }
+
+    @Test
+    fun headingIsKnownOnlyOnceMeasured() {
+        gnss(12.90000, speed = 0f)
+        assertFalse("standing, no course yet", nav.state().headingKnown)
+        gnss(12.90009, speed = 10f, bearing = 45f)
+        assertTrue(nav.state().headingKnown)
+        assertEquals(45.0, nav.state().headingDeg, 0.001)
     }
 
     @Test

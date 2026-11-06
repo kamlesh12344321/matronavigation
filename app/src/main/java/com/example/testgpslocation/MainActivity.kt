@@ -40,7 +40,7 @@ import com.example.testgpslocation.engine.PositionSource
 import com.example.testgpslocation.engine.TestDriveMode
 import com.example.testgpslocation.engine.TestDriveState
 import com.example.testgpslocation.map.NavigationOverlay
-import com.example.testgpslocation.service.HandyFeed
+import com.example.testgpslocation.sensor.SensorHub
 import com.example.testgpslocation.service.LocationTrackerService
 import com.example.testgpslocation.utils.NetworkStatus
 import com.example.testgpslocation.utils.TelemetryLogger
@@ -176,7 +176,6 @@ class MainActivity : AppCompatActivity() {
                 launch { NavigationController.testDrive.collect(::renderTestDrive) }
                 launch { NavigationController.cachedLines.collect { cachedLines = it } }
                 launch { NavigationController.lineStatus.collect { offlineText.text = it } }
-                launch { HandyFeed.status.collect { refreshWarnings() } }
                 launch {
                     LocationTrackerService.isRunning.collect { running ->
                         btnLogging.setText(if (running) R.string.stop_logging else R.string.start_logging)
@@ -189,12 +188,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        if (!hasFineLocation()) requestPermissions()
+        if (!hasFineLocation() || (!hasStepPermission() && !stepPermissionAsked())) requestPermissions()
     }
 
     override fun onStart() {
         super.onStart()
         startTracking()
+        NavigationController.refreshStepSensor()
     }
 
     override fun onResume() {
@@ -292,7 +292,6 @@ class MainActivity : AppCompatActivity() {
         PopupMenu(this, anchor).apply {
             inflate(R.menu.map_menu)
             menu.findItem(R.id.menuDetails).setTitle(if (details.visibility == View.VISIBLE) R.string.hide_details else R.string.show_details)
-            menu.findItem(R.id.menuHandyFeed).isChecked = HandyFeed.isWanted(this@MainActivity)
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     R.id.menuTestDrive -> showTestDriveDialog()
@@ -303,11 +302,6 @@ class MainActivity : AppCompatActivity() {
                     }
                     R.id.menuRefreshLines -> NavigationController.refreshLinesHere()
                     R.id.menuDownloadCity -> NavigationController.downloadCity()
-                    R.id.menuHandyFeed -> {
-                        HandyFeed.setWanted(this@MainActivity, !item.isChecked)
-                        Toast.makeText(this@MainActivity, if (item.isChecked) R.string.handy_feed_off else R.string.handy_feed_on, Toast.LENGTH_LONG).show()
-                        refreshWarnings()
-                    }
                 }
                 true
             }
@@ -408,7 +402,8 @@ class MainActivity : AppCompatActivity() {
     /** What each marker colour means. */
     private fun legend(): CharSequence = SpannableStringBuilder().apply {
         listOf(
-            PositionSource.GPS to "GPS", PositionSource.NETWORK to "Network", PositionSource.TRACK to "Track",
+            PositionSource.GPS to "GPS", PositionSource.NETWORK to "Network", PositionSource.ESTIMATE to "GPS estimate",
+            PositionSource.TRACK to "Track",
             PositionSource.DEAD_RECKONING to "Dead reckoning"
         ).forEach { (source, name) ->
             append("●", ForegroundColorSpan(NavigationOverlay.colorFor(source)), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
@@ -427,6 +422,7 @@ class MainActivity : AppCompatActivity() {
             s.gpsAvailable -> "GPS ACTIVE" to "#4CAF50"
             s.source == PositionSource.TRACK -> "NO GPS · UNDERGROUND NAV" to "#FFB300"
             s.source == PositionSource.NETWORK -> "NO GPS · NETWORK LOCATION" to "#FFB300"
+            s.source == PositionSource.ESTIMATE -> "NO GPS · PHONE ESTIMATE" to "#FFB300"
             s.source == PositionSource.DEAD_RECKONING -> "NO GPS · DEAD RECKONING" to "#FF7043"
             else -> "WAITING FOR LOCATION" to "#9E9E9E"
         }
@@ -526,14 +522,16 @@ class MainActivity : AppCompatActivity() {
             !hasFineLocation() -> Warning("Precise location is off, so GPS cannot be used. Allow \"Precise\" location.") { openAppSettings() }
             !NavigationController.isLocationEnabled -> Warning("Location is turned off on this phone.") { resolveLocationSettings() }
             TelemetryLogger.lastError != null -> Warning(TelemetryLogger.lastError!!, null)
+            !NavigationController.isNetworkLocationEnabled ->
+                Warning("Network location is off: turn on Google Location Accuracy so Wi-Fi and mobile towers can be used.") { resolveLocationSettings() }
             LocationTrackerService.isRunning.value && !isIgnoringBatteryOptimizations() ->
                 Warning("Battery optimisation may pause navigation with the screen off.") { openBatterySettings() }
-            HandyFeed.isWanted(this) && HandyFeed.status.value == HandyFeed.Status.NOT_ALLOWED ->
-                Warning("Nemo Handy cannot get the position: in Developer options, set \"Select mock location app\" to Metro Navigator.") {
-                    safeStart(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+            LocationTrackerService.isRunning.value && isSamsung() && !samsungSleepHandled() ->
+                Warning("Samsung can put this app to sleep and stop logging: add it to Settings › Battery › Background usage limits › Never sleeping apps.") {
+                    getSharedPreferences(WARNING_PREFS, MODE_PRIVATE).edit().putBoolean(KEY_SAMSUNG_SLEEP, true).apply()
+                    safeStart(Intent(Intent.ACTION_POWER_USAGE_SUMMARY))
+                    refreshWarnings()
                 }
-            HandyFeed.isWanted(this) && !LocationTrackerService.isRunning.value ->
-                Warning("Start logging to send the position to Nemo Handy.", null)
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !NotificationManagerCompat.from(this).areNotificationsEnabled() ->
                 Warning("Notifications are off: the logging notification will be hidden.") { openNotificationSettings() }
             caps != null && !caps.hasLinearAcceleration && !caps.hasAccelerometer ->
@@ -542,9 +540,15 @@ class MainActivity : AppCompatActivity() {
             caps != null && !caps.hasRotationVector ->
                 Warning("No orientation sensor: pick your destination so the direction of travel is known.", null)
             s.mockLocation -> Warning("Mock (fake) GPS locations detected; results are not real.", null)
+            !hasStepPermission() -> Warning("Allow Physical activity so walking can be followed without GPS.") { openAppSettings() }
             else -> null
         }
     }
+
+    private fun isSamsung() = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+
+    /** Android cannot tell whether the app is on that list: asked once, until Fix is tapped. */
+    private fun samsungSleepHandled() = getSharedPreferences(WARNING_PREFS, MODE_PRIVATE).getBoolean(KEY_SAMSUNG_SLEEP, false)
 
     private fun resolveLocationSettings() {
         val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L).build()
@@ -597,13 +601,20 @@ class MainActivity : AppCompatActivity() {
     private fun hasFineLocation() =
         ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
+    private fun hasStepPermission() = SensorHub.hasStepPermission(this)
+
+    /** Asked once: after a refusal the warning's Fix leads to Settings, without restarting the sensors on every open. */
+    private fun stepPermissionAsked() = getSharedPreferences(WARNING_PREFS, MODE_PRIVATE).getBoolean(KEY_STEP_PERMISSION_ASKED, false)
+
     private fun hasAnyLocation() = hasFineLocation() ||
         ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     private fun requestPermissions() {
         permissionAskedOnce = true
+        getSharedPreferences(WARNING_PREFS, MODE_PRIVATE).edit().putBoolean(KEY_STEP_PERMISSION_ASKED, true).apply()
         val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) perms.add(Manifest.permission.ACTIVITY_RECOGNITION)
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         requestPermissions(perms.toTypedArray(), PERMISSION_REQUEST_CODE)
     }
@@ -630,6 +641,9 @@ class MainActivity : AppCompatActivity() {
         const val LOCATION_SETTINGS_REQUEST_CODE = 3002
         const val CLIENT = "activity"
         const val OSMDROID_PREFS = "osmdroid"
+        const val WARNING_PREFS = "warnings"
+        const val KEY_SAMSUNG_SLEEP = "samsung_sleep_handled"
+        const val KEY_STEP_PERMISSION_ASKED = "step_permission_asked"
         const val OSM_COPYRIGHT_URL = "https://www.openstreetmap.org/copyright"
 
         /**

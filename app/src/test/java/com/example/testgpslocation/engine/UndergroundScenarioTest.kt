@@ -17,6 +17,39 @@ class UndergroundScenarioTest {
     private fun ride(name: String, cfg: SimConfig): SimResult =
         TunnelSimulator(cfg).run().also { println(it.summary(name)) }
 
+    // ---- Barometer -------------------------------------------------------------------------------
+
+    @Test
+    fun aBarometerDoesNotDisturbTheRide() {
+        repeat(3) { k ->
+            val r = ride("barometer-$k", SimConfig(barometer = true, seed = 1600 + k))
+            assertEquals("seed $k", allStops, r.stationsAtStops)
+            assertTrue("seed $k stop errors ${r.stopErrors}", r.stopErrors.all { it < 5.0 })
+        }
+    }
+
+    @Test
+    fun theBarometerFindsStopsThePhoneCannotSee() {
+        // Held in the hand, or air conditioning: the phone never reads still at a platform.
+        repeat(3) { k ->
+            val r = ride("barometer-moving-$k", SimConfig(barometer = true, stillReadsMoving = true, seed = 1610 + k))
+            assertEquals("seed $k", allStops, r.stationsAtStops)
+            assertTrue("seed $k stop errors ${r.stopErrors}", r.stopErrors.all { it < 5.0 })
+        }
+    }
+
+    // ---- GPS chip estimates --------------------------------------------------------------------
+
+    @Test
+    fun noSatelliteGpsFixesInTheTunnelDoNotHideTheStops() {
+        // Seen on an S24: the GPS provider went on for 50 s with no satellite in use.
+        repeat(3) { k ->
+            val r = ride("chip-estimate-$k", SimConfig(gpsUntilMeters = 600.0, chipEstimateSec = 50.0, seed = 1500 + k))
+            assertEquals("seed $k", allStops, r.stationsAtStops)
+            assertTrue("seed $k stop errors ${r.stopErrors}", r.stopErrors.all { it < 5.0 })
+        }
+    }
+
     // ---- Long tunnel, position and speed --------------------------------------------------------
 
     @Test
@@ -168,6 +201,67 @@ class UndergroundScenarioTest {
             assertTrue("$name: same coordinates for ${r.longestRepeatWhileMovingSec} s while moving", r.longestRepeatWhileMovingSec <= 2.0)
             assertEquals("$name: moved while standing", 0.0, r.movedWhileStoppedSec, 1e-9)
         }
+    }
+
+    @Test
+    fun aRoundTripTurnsBackAtTheEndOfTheLine() {
+        val back = allStops + TunnelWorld.names.dropLast(1).reversed().drop(1) + "S0"
+        // Even when the train's own magnetism throws the compass right off after it reverses.
+        listOf(null, 150.0, -130.0).forEachIndexed { k, returnError ->
+            val r = ride("round-trip-$k", SimConfig(roundTrip = true, compassErrorOnReturnDeg = returnError, seed = 1500 + k))
+            assertEquals("return compass $returnError", r.expectedStations, r.stationsAtStops)
+            assertEquals(back.size, r.stationsAtStops.size)
+            assertTrue("stop errors ${r.stopErrors}", r.stopErrors.all { it < 5.0 })
+        }
+    }
+
+    @Test
+    fun aWrongCompassDirectionAtTheStartIsCorrectedByTheNetwork() {
+        // Underground start, compass 180° off: no GPS to tell the direction, network fixes ±300 m.
+        val r = ride("wrong-way-network", SimConfig(gpsUntilMeters = null, startStation = 3, compassErrorDeg = 180.0,
+            networkEverySec = 10.0, seed = 1510))
+        assertTrue("events ${r.events}", r.events.any { it.startsWith("Direction corrected from network") })
+        assertEquals(r.expectedStations, r.stationsAtStops)
+    }
+
+    @Test
+    fun aWrongCompassDirectionAtTheStartIsCorrectedByTheFirstCurve() {
+        // No network either: the first stations are wrong, then a curve shows the truth.
+        listOf(3, 8).forEach { start ->
+            val r = ride("wrong-way-curve-$start", SimConfig(gpsUntilMeters = null, startStation = start, compassErrorDeg = 180.0, seed = 1520 + start))
+            assertTrue("events ${r.events}", r.events.any { it.startsWith("Direction corrected from the line's curves") })
+            assertTrue("last stops ${r.stopErrors}", r.stopErrors.takeLast(4).all { it < 10.0 })
+        }
+    }
+
+    @Test
+    fun theRightCompassDirectionIsNotTurnedRound() {
+        // A compass-only direction that is right, on a line full of different runs: never "corrected".
+        repeat(10) { k ->
+            val r = TunnelSimulator(SimConfig(gpsUntilMeters = null, startStation = 3, segmentSpeeds = true, seed = 1530 + k)).run()
+            assertTrue("seed $k: ${r.events}", r.events.none { it.startsWith("Direction corrected") })
+        }
+    }
+
+    @Test
+    fun aRestartInMidRideCarriesOn() {
+        // Killed between stations, and during a stop; back after 20 s and after a minute.
+        listOf(3000.0 to 20.0, 3700.0 to 20.0, 9000.0 to 60.0).forEachIndexed { k, (at, gap) ->
+            val r = ride("restart-$k", SimConfig(restartAtMeters = at, restartGapSec = gap, seed = 1540 + k))
+            assertTrue("events ${r.events}", r.events.any { it.startsWith("Ride resumed after a restart") })
+            assertTrue("last stops ${r.stopErrors}", r.stopErrors.takeLast(10).all { it < 5.0 })
+            assertEquals(r.expectedStations.takeLast(10), r.stationsAtStops.takeLast(10))
+        }
+    }
+
+    @Test
+    fun aSavedRideReadsBackTheSame() {
+        val s = RideState("line-1", 12.9, 77.6, 4200.0, -1, true, false, 123.0, 14.5, 18.0, 66.0, "S4", 1_000L)
+        assertEquals(s, RouteJson.readRide(RouteJson.writeRide(s)))
+        val noLine = s.copy(routeId = null, lastStation = null)
+        assertEquals(noLine, RouteJson.readRide(RouteJson.writeRide(noLine)))
+        val onFoot = s.copy(inVehicle = false, headingKnown = false)
+        assertEquals(onFoot, RouteJson.readRide(RouteJson.writeRide(onFoot)))
     }
 
     @Test

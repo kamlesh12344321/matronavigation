@@ -299,7 +299,7 @@ class MetroRouteService(context: Context) {
     }
 }
 
-/** The saved form of a [MetroRoute]: offline metro lines and test-drive routes. */
+/** The saved form of a [MetroRoute] (offline metro lines, test-drive routes) and of a [RideState]. */
 object RouteJson {
     const val VERSION = 2
 
@@ -325,6 +325,24 @@ object RouteJson {
         }
         return MetroRoute(root.getString("id"), root.getString("lineName"), root.optStringOrNull("from"), root.optStringOrNull("to"), track, stations)
             .takeIf { it.isValid }
+    }
+
+    fun writeRide(s: RideState): String = JSONObject().apply {
+        s.routeId?.let { put("route", it) }
+        put("lat", s.latitude); put("lon", s.longitude); put("along", s.distanceAlongLine)
+        put("direction", s.direction); put("directionKnown", s.directionKnown); put("directionUnconfirmed", s.directionUnconfirmed)
+        put("heading", s.headingDeg); put("speed", s.speedMps); put("cruise", s.cruiseSpeedMps); put("error", s.uncertaintyMeters)
+        s.lastStation?.let { put("lastStation", it) }
+        put("savedAt", s.savedAtMs)
+        put("inVehicle", s.inVehicle); put("headingKnown", s.headingKnown)
+    }.toString()
+
+    /** Throws on malformed JSON. */
+    fun readRide(text: String): RideState = JSONObject(text).run {
+        RideState(optStringOrNull("route"), getDouble("lat"), getDouble("lon"), getDouble("along"), getInt("direction"),
+            getBoolean("directionKnown"), getBoolean("directionUnconfirmed"), getDouble("heading"), getDouble("speed"),
+            getDouble("cruise"), getDouble("error"), optStringOrNull("lastStation"), getLong("savedAt"),
+            optBoolean("inVehicle", true), optBoolean("headingKnown", true))
     }
 
     private fun JSONObject.optStringOrNull(key: String): String? =

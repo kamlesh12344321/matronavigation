@@ -23,7 +23,7 @@ import kotlin.random.Random
  *
  * Phone: world-frame accelerometer = tangential + centripetal acceleration, rotated by a
  * compass error (magnetic disturbance), plus bias and noise. GPS only until the tunnel
- * portal (optional); the watchdog reports the loss 6 s after the last fix. No network or radio
+ * portal (optional); the watchdog reports the loss 3 s after the last fix. No network or radio
  * underground: the sensors and the line data alone.
  */
 object TunnelWorld {
@@ -91,6 +91,20 @@ data class SimConfig(
      * "still"; only the vibration (0.05 standing vs 0.25 running) shows the stop.
      */
     val stillReadsMoving: Boolean = false,
+    /** After GPS ends the chip sends fixes with no satellites this long: straight on at the last speed, whatever the train does. */
+    val chipEstimateSec: Double? = null,
+    /** A barometer: steady while standing, changing while the train pushes the tunnel air around. */
+    val barometer: Boolean = false,
+    /** Turn back at the last station and ride to the first one. */
+    val roundTrip: Boolean = false,
+    /** The compass error on the way back: the train's own magnetism turns round with it. */
+    val compassErrorOnReturnDeg: Double? = null,
+    /** The app is killed once the train has run this far, and restarted [restartGapSec] later from its saved ride. */
+    val restartAtMeters: Double? = null,
+    val restartGapSec: Double = 20.0,
+    /** A network fix this often (± [networkAccuracy]), also underground; null = none. */
+    val networkEverySec: Double? = null,
+    val networkAccuracy: Float = 300f,
     /** Gyroscope turn rate available (noise 0.3 °/s, bias 0.05 °/s). */
     val gyro: Boolean = true,
     val gyroNoiseDps: Double = 0.3,
@@ -145,9 +159,10 @@ class TunnelSimulator(private val cfg: SimConfig) {
     private fun gauss(): Double { val u = rnd.nextDouble().coerceAtLeast(1e-12); return sqrt(-2 * ln(u)) * cos(2 * Math.PI * rnd.nextDouble()) }
 
     fun run(): SimResult {
-        val nav = UndergroundNavigator()
+        var nav = UndergroundNavigator()
         if (cfg.setRouteBeforeStart) nav.setRoute(cfg.navigatorRoute ?: route)
-        val dir = if (cfg.endStation >= cfg.startStation) 1 else -1
+        var dir = if (cfg.endStation >= cfg.startStation) 1 else -1
+        val startDir = dir
         val sd = TunnelWorld.stationDistances
 
         // Stops in order: stations (not skipped) and the optional signal stop.
@@ -160,6 +175,13 @@ class TunnelSimulator(private val cfg: SimConfig) {
         }
         cfg.signalStopAt?.let { sig -> stops += Stop(sig, null, cfg.signalStopSec) }
         stops.sortBy { dir * it.at }
+        if (cfg.roundTrip) {
+            var j = cfg.endStation - dir
+            while (if (dir > 0) j >= cfg.startStation else j <= cfg.startStation) {
+                if (j !in cfg.skipStations) stops += Stop(sd[j], j, cfg.dwellSec)
+                j -= dir
+            }
+        }
 
         var clock = 1_000_000L
         var s = sd[cfg.startStation]
@@ -189,6 +211,13 @@ class TunnelSimulator(private val cfg: SimConfig) {
         var repeatSec = 0.0; var repeatMax = 0.0
         var repeatMovingSec = 0.0; var repeatMovingMax = 0.0
         var movedStopped = 0.0
+        var nextNetworkMs = clock
+        var chipFrom: GpsPoint? = null
+        var simHeight = 0.0
+        var nextChipMs = clock
+        var restartPending = cfg.restartAtMeters != null
+        var savedRide: RideState? = null
+        var resumeAtMs = 0L
         var changedLast = false
 
         if (!gpsOn && cfg.entranceFix) {
@@ -207,6 +236,7 @@ class TunnelSimulator(private val cfg: SimConfig) {
                 if (dwellLeft <= 0 && stopIdx >= stops.size) break
             } else {
                 val stop = stops[stopIdx]
+                if (stop.at != s) dir = if (stop.at > s) 1 else -1
                 val cruise = if (cfg.segmentSpeeds) TunnelWorld.segmentCruise(s, dir) else cfg.cruise
                 val rem = dir * (stop.at - s)
                 val brakeDist = v * v / (2 * cfg.decel)
@@ -228,6 +258,20 @@ class TunnelSimulator(private val cfg: SimConfig) {
             }
             val truth = route.pointAt(s)
 
+            // The app dies here: the train goes on without it, then it starts again from its saved ride.
+            if (restartPending && travelled >= (cfg.restartAtMeters ?: Double.MAX_VALUE)) {
+                restartPending = false
+                savedRide = nav.rideState(clock)
+                resumeAtMs = clock + (cfg.restartGapSec * 1000).toLong()
+            }
+            if (resumeAtMs != 0L) {
+                if (clock < resumeAtMs) continue
+                resumeAtMs = 0L
+                events += nav.events
+                nav = UndergroundNavigator()
+                savedRide?.let { nav.resume(it, cfg.navigatorRoute ?: route, cfg.restartGapSec, clock) }
+            }
+
             // GPS until the portal
             if (gpsOn && travelled >= (cfg.gpsUntilMeters ?: 0.0)) gpsOn = false
             if (gpsOn && clock - lastGpsMs >= 1000) {
@@ -235,16 +279,24 @@ class TunnelSimulator(private val cfg: SimConfig) {
                 nav.onLocationFix(GpsPoint(nl, no, 5f, clock, v.toFloat(), route.bearingAt(s, dir).toFloat(), hasSpeed = true,
                     hasBearing = v > 1.0, elapsedRealtimeMs = clock, isGnss = true), clock)
                 lastGpsMs = clock
+                chipFrom = GpsPoint(truth.lat, truth.lon, 5f, clock, v.toFloat(), route.bearingAt(s, dir).toFloat())
+            }
+            val chip = chipFrom
+            if (!gpsOn && chip != null && cfg.chipEstimateSec != null && clock >= nextChipMs && clock - lastGpsMs <= cfg.chipEstimateSec * 1000) {
+                nextChipMs = clock + 1000
+                val ran = chip.speedMeterPerSecond * (clock - lastGpsMs) / 1000.0
+                val (cl, co) = GeoToolbox.moveLocation(chip.latitude, chip.longitude, ran, chip.bearingDegree.toDouble())
+                nav.onLocationFix(GpsPoint(cl, co, 50f, clock, chip.speedMeterPerSecond, chip.bearingDegree, hasSpeed = true, hasBearing = true, elapsedRealtimeMs = clock, isGnss = false, isChipEstimate = true), clock)
             }
             val watchdogRef = if (lastGpsMs == 0L) 1_000_000L else lastGpsMs
-            if (!gpsOn && !lostReported && clock - watchdogRef >= 6000) { nav.onGpsLost(clock); lostReported = true }
+            if (!gpsOn && !lostReported && clock - watchdogRef >= 3000) { nav.onGpsLost(clock); lostReported = true }
 
             // IMU: tangential + centripetal, rotated by the compass error, plus bias and noise.
             val b = route.bearingAt(s, dir)
             val ahead = route.bearingAt((s + dir * 20.0).coerceIn(0.0, route.length), dir)
             var dTheta = ahead - b; if (dTheta > 180) dTheta -= 360; if (dTheta < -180) dTheta += 360
             val lateral = v * v * Math.toRadians(dTheta) / 20.0
-            val c = cfg.compassErrorDeg
+            val c = if (dir != startDir) cfg.compassErrorOnReturnDeg ?: cfg.compassErrorDeg else cfg.compassErrorDeg
             val br = Math.toRadians(b + c); val lr = Math.toRadians(b + 90 + c)
             var east = a * sin(br) + lateral * sin(lr) + cfg.accelBiasEast + gauss() * cfg.accelNoise
             var north = a * cos(br) + lateral * cos(lr) + cfg.accelBiasNorth + gauss() * cfg.accelNoise
@@ -280,9 +332,19 @@ class TunnelSimulator(private val cfg: SimConfig) {
                 if (jiggle) { east = gauss() * 1.2; north = gauss() * 1.2; yaw = gauss() * 40.0 } // hand motion, zero mean
             }
             val vibration = if (v > 0.0 || jiggle) 0.25 + 0.03 * vibRnd.nextDouble() else 0.05 + 0.01 * vibRnd.nextDouble()
+            if (v > 0.5) simHeight += (vibRnd.nextDouble() - 0.5) * 0.6
             nav.onMotion(MotionSample(clock, dt, state, if (state == MotionState.STATIONARY) stillFor else 0, east, north,
-                orientationKnown = cfg.orientationKnown, yawRateDps = if (cfg.gyro) yaw else Double.NaN, vibration = vibration))
+                orientationKnown = cfg.orientationKnown, yawRateDps = if (cfg.gyro) yaw else Double.NaN, vibration = vibration,
+                heightMeters = if (cfg.barometer) simHeight else Double.NaN))
 
+            // Network location, where the tunnel has coverage and data.
+            cfg.networkEverySec?.let { every ->
+                if (clock >= nextNetworkMs) {
+                    nextNetworkMs = clock + (every * 1000).toLong()
+                    val (nl, no) = GeoToolbox.moveLocation(truth.lat, truth.lon, vibRnd.nextDouble() * cfg.networkAccuracy, vibRnd.nextDouble() * 360)
+                    nav.onLocationFix(GpsPoint(nl, no, cfg.networkAccuracy, clock, elapsedRealtimeMs = clock, isGnss = false), clock)
+                }
+            }
             events += nav.events; nav.events.clear()
 
             // Metrics, once GPS is gone
@@ -320,7 +382,10 @@ class TunnelSimulator(private val cfg: SimConfig) {
                     measured++
                     val nextTruth = stops.getOrNull(stopIdx)?.station ?: stop.station
                     // Next station on the line in the travel direction (skipped ones included).
-                    val nextOnLine = TunnelWorld.names.getOrNull(stop.station + dir)
+                    // At the end of the line the next run is back the way it came.
+                    val nextDir = stops.getOrNull(stopIdx)?.let { if (it.at >= stop.at) 1 else -1 }
+                        ?: if (stop.station + dir in TunnelWorld.names.indices) dir else -dir
+                    val nextOnLine = TunnelWorld.names.getOrNull(stop.station + nextDir)
                     if (est.nextStation == nextOnLine || (nextTruth == stop.station && est.nextStation == null)) dirOk++
                 }
             }

@@ -226,6 +226,7 @@ class NavigationOverlay(metrics: DisplayMetrics) : Overlay() {
             PositionSource.GPS -> "#00E676"
             PositionSource.TRACK -> "#4FC3F7"
             PositionSource.NETWORK -> "#CE93D8"
+            PositionSource.ESTIMATE -> "#FFD54F"
             PositionSource.DEAD_RECKONING -> "#FF7043"
             PositionSource.NONE -> "#9E9E9E"
         })

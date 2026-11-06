@@ -1,10 +1,39 @@
 package com.example.testgpslocation.engine
 
+import com.example.testgpslocation.sensor.ChipEstimateCheck
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** Building blocks: which positions reach the log and map, and the line's curves. */
 class PositioningComponentsTest {
+
+    // ---- GPS chip estimates ---------------------------------------------------------------------
+
+    @Test
+    fun aGpsFixIsAnEstimateOnlyOnARecentReportOfNoSatellites() {
+        val c = ChipEstimateCheck()
+        assertFalse("no reports at all", c.isEstimate(mock = false, nowMs = 1_000))
+        c.onSatelliteStatus(0, 1_000)
+        assertFalse("this phone never reported a satellite", c.isEstimate(mock = false, nowMs = 1_000))
+        c.onSatelliteStatus(8, 2_000)
+        assertFalse(c.isEstimate(mock = false, nowMs = 2_000))
+        c.onSatelliteStatus(0, 3_000)
+        assertTrue(c.isEstimate(mock = false, nowMs = 3_500))
+        assertFalse("a mock fix is not the chip's", c.isEstimate(mock = true, nowMs = 3_500))
+        assertFalse("a stale report must not block real GPS", c.isEstimate(mock = false, nowMs = 7_000))
+    }
+
+    @Test
+    fun fusedFixesCountAsEstimatesOnlyWhileTheChipIsEstimating() {
+        val c = ChipEstimateCheck()
+        assertFalse(c.estimatesRunning(1_000))
+        c.onSatelliteStatus(8, 1_000); c.onSatelliteStatus(0, 2_000)
+        c.isEstimate(mock = false, nowMs = 2_000)
+        assertTrue(c.estimatesRunning(4_000))
+        assertFalse(c.estimatesRunning(6_000))
+    }
 
     // ---- Log / map output -----------------------------------------------------------------------
 

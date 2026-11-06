@@ -9,6 +9,7 @@ import org.junit.Before
 import org.junit.Test
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.min
 import kotlin.math.sin
 
 /**
@@ -36,12 +37,12 @@ class NoGpsDrivingTest {
 
     /** One 100 ms motion sample; the true position moves [speed] along [bearing]. */
     private fun sample(state: MotionState, speed: Double = 0.0, bearing: Double = 0.0, accel: Double = 0.0,
-                       yawDps: Double = 0.0, stillForMs: Long = 0, vibration: Double = Double.NaN) {
+                       yawDps: Double = 0.0, stillForMs: Long = 0, vibration: Double = Double.NaN, steps: Int = 0) {
         clock += 100
         if (speed > 0) GeoToolbox.moveLocation(lat, lon, speed * 0.1, bearing).let { (a, b) -> lat = a; lon = b }
         val b = Math.toRadians(bearing)
         nav.onMotion(MotionSample(clock, 0.1, state, if (state == MotionState.STATIONARY) stillForMs else 0,
-            accel * sin(b), accel * cos(b), orientationKnown = true, yawRateDps = yawDps, vibration = vibration))
+            accel * sin(b), accel * cos(b), orientationKnown = true, yawRateDps = yawDps, vibration = vibration, steps = steps))
     }
 
     /** Driving at [speed] along [bearing] with a GPS fix every second. */
@@ -59,6 +60,245 @@ class NoGpsDrivingTest {
     }
 
     private fun distanceFromTruth() = GeoToolbox.calculateDistance(nav.currentLat, nav.currentLon, lat, lon)
+
+    /** Drove 30 s with GPS at driving vibration, stopped, then GPS and network gone; stands [standSec]. */
+    private fun driveStopAndLoseEverything(standSec: Int) {
+        repeat(30) { repeat(10) { sample(MotionState.MOVING, 10.0, 0.0, vibration = 0.4) }; fix(10f, 0f) }
+        repeat(3) { repeat(10) { k -> sample(MotionState.STATIONARY, stillForMs = (k + 1) * 100L, vibration = 0.03) }; fix(0f, 0f) }
+        nav.onGpsLost(clock)
+        repeat(standSec * 10) { k -> sample(MotionState.STATIONARY, stillForMs = 3_000L + (k + 1) * 100L, vibration = 0.03) }
+    }
+
+    /** Walking at 1 m/s: a 0.6 m step every 600 ms, the phone shaking; a GPS fix each second when [gps]. */
+    private fun walk(seconds: Int, bearing: Double, gps: Boolean) {
+        repeat(seconds * 10) { k ->
+            sample(MotionState.WALKING, 1.0, bearing, vibration = 1.5, steps = if (k % 6 == 0) 1 else 0)
+            if (gps && k % 10 == 9) fix(1f, bearing.toFloat())
+        }
+    }
+
+    private fun network(accuracy: Float = 30f) =
+        nav.onLocationFix(GpsPoint(lat, lon, accuracy, clock, elapsedRealtimeMs = clock, isGnss = false), clock)
+
+    @Test
+    fun onFootWithoutGpsTheMarkerFollowsTheSteps() {
+        walk(30, 0.0, gps = true) // learns this walker's 0.6 m stride
+        nav.onGpsLost(clock)
+        val startLat = nav.currentLat
+        walk(60, 0.0, gps = false)
+        val walked = (nav.currentLat - startLat) * 111_195.0
+        assertEquals(60.0, walked, 3.0)
+        assertEquals(1.0, nav.state().speedMps, 0.1)
+        assertEquals(PositionSource.DEAD_RECKONING, nav.state().source)
+        assertTrue("off by ${distanceFromTruth()} m", distanceFromTruth() < 6.0)
+    }
+
+    @Test
+    fun aTurnOnFootIsFollowedHoweverFast() {
+        walk(30, 0.0, gps = true)
+        nav.onGpsLost(clock)
+        walk(20, 0.0, gps = false)
+        repeat(10) { sample(MotionState.WALKING, 1.0, 90.0, yawDps = 90.0, vibration = 1.5) } // 90° in a second
+        walk(20, 90.0, gps = false)
+        assertTrue("off by ${distanceFromTruth()} m", distanceFromTruth() < 6.0)
+    }
+
+    @Test
+    fun stoppingOnFootStopsTheMarker() {
+        walk(30, 0.0, gps = true)
+        nav.onGpsLost(clock)
+        walk(10, 0.0, gps = false)
+        repeat(25) { sample(MotionState.MOVING, vibration = 0.2) } // phone in the hand: never quite still
+        val stopLat = nav.currentLat
+        repeat(300) { sample(MotionState.MOVING, vibration = 0.2) }
+        assertEquals(stopLat, nav.currentLat, 1e-9)
+        assertEquals(0.0, nav.state().speedMps, 1e-9)
+    }
+
+    @Test
+    fun walkingWithoutAKnownDirectionHoldsThePositionAndDoubtsIt() {
+        fix(0f, 0f)
+        nav.onGpsLost(clock + 3000)
+        val startLat = nav.currentLat; val startError = nav.state().uncertaintyMeters
+        walk(30, 0.0, gps = false)
+        assertEquals(startLat, nav.currentLat, 1e-9)
+        assertTrue("error ${nav.state().uncertaintyMeters}", nav.state().uncertaintyMeters >= startError + 30 * 0.7 * 0.9)
+    }
+
+    @Test
+    fun stepsAreIgnoredInAVehicle() {
+        driveStopAndLoseEverything(standSec = 5) // a rough road or someone walking past can look like steps
+        val stopLat = nav.currentLat
+        repeat(300) { k -> sample(MotionState.MOVING, vibration = 0.2, steps = if (k % 6 == 0) 1 else 0) }
+        assertEquals(stopLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aWalkerStaysAWalkerAfterTheAppRestarts() {
+        walk(30, 0.0, gps = true)
+        nav.onGpsLost(clock)
+        walk(5, 0.0, gps = false)
+        val saved = RouteJson.readRide(RouteJson.writeRide(nav.rideState(clock)!!)) // through the file, as in the app
+        assertFalse(saved.inVehicle)
+        nav = UndergroundNavigator()
+        nav.resume(saved, null, 2.0, clock)
+        val startLat = nav.currentLat
+        repeat(100) { sample(MotionState.MOVING, vibration = 0.2) } // no steps: no vehicle model running at 12 m/s
+        assertTrue("moved ${(nav.currentLat - startLat) * 111_195.0} m", (nav.currentLat - startLat) * 111_195.0 < 15.0)
+    }
+
+    @Test
+    fun aWalkerWithNoKnownDirectionStaysPutAfterTheAppRestarts() {
+        fix(0f, 0f)
+        nav.onGpsLost(clock + 3000)
+        val saved = RouteJson.readRide(RouteJson.writeRide(nav.rideState(clock)!!))
+        assertFalse(saved.headingKnown)
+        nav = UndergroundNavigator()
+        nav.resume(saved, null, 2.0, clock)
+        val startLat = nav.currentLat
+        walk(20, 0.0, gps = false)
+        assertEquals(startLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aWalkerWhoStopsJustAsGpsIsLostStaysThere() {
+        walk(30, 0.0, gps = true)
+        repeat(10) { sample(MotionState.MOVING, vibration = 0.2) }
+        fix(1.2f, 0f) // the chip's last reading still says walking
+        nav.onGpsLost(clock + 100)
+        val stopLat = nav.currentLat
+        repeat(600) { sample(MotionState.MOVING, vibration = 0.2) }
+        assertEquals(stopLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun walkingIsFollowedEvenWithoutAStepSensor() {
+        repeat(300) { k ->
+            sample(MotionState.WALKING, 1.0, 0.0, vibration = 1.5)
+            if (k % 10 == 9) fix(1f, 0f)
+        }
+        nav.onGpsLost(clock)
+        val startLat = nav.currentLat
+        repeat(300) { sample(MotionState.WALKING, 1.0, 0.0, vibration = 1.5) }
+        val walked = (nav.currentLat - startLat) * 111_195.0
+        assertTrue("walked $walked m of 30", walked in 25.0..45.0)
+        repeat(10) { sample(MotionState.MOVING, vibration = 0.2) }
+        val stopLat = nav.currentLat
+        repeat(300) { sample(MotionState.MOVING, vibration = 0.2) }
+        assertTrue("drifted ${(nav.currentLat - stopLat) * 111_195.0} m", abs(nav.currentLat - stopLat) * 111_195.0 < 2.0)
+    }
+
+    @Test
+    fun aVehicleThatLooksLikeStepsStillShowsItsPullAway() {
+        repeat(30) { k -> sample(MotionState.STATIONARY, stillForMs = (k + 1) * 100L) }
+        fix(0f, 0f)
+        nav.onGpsLost(clock)
+        repeat(30) { k -> sample(MotionState.STATIONARY, stillForMs = 3_000L + (k + 1) * 100L) }
+        var v = 0.0
+        repeat(100) { k -> v += 0.15; sample(MotionState.MOVING, v, 0.0, accel = 1.5, vibration = 0.4, steps = if (k % 6 == 0) 1 else 0) }
+        assertTrue("speed ${nav.state().speedMps}", nav.state().speedMps > 5.0)
+    }
+
+    @Test
+    fun drivingAfterAWalkKeepsItsSpeedWhenGpsIsLost() {
+        walk(30, 0.0, gps = true)
+        nav.onGpsLost(clock)
+        walk(5, 0.0, gps = false)
+        driveWithGps(20, 10.0, 0.0)
+        nav.onGpsLost(clock)
+        repeat(30) { sample(MotionState.MOVING, 10.0, 0.0) }
+        assertTrue("speed ${nav.state().speedMps}", nav.state().speedMps > 8.0)
+    }
+
+    @Test
+    fun aShortDriveStillRestartsFromTheVibration() {
+        repeat(10) { repeat(10) { sample(MotionState.MOVING, 10.0, 0.0, vibration = 0.4) }; fix(10f, 0f) } // too short to know the driving level
+        repeat(3) { repeat(10) { k -> sample(MotionState.STATIONARY, stillForMs = (k + 1) * 100L, vibration = 0.03) }; fix(0f, 0f) }
+        nav.onGpsLost(clock)
+        repeat(100) { k -> sample(MotionState.STATIONARY, stillForMs = 3_000L + (k + 1) * 100L, vibration = 0.03) }
+        val stopLat = nav.currentLat
+        var v = 0.0; var firstMoveSec = -1.0
+        repeat(200) { k ->
+            v = min(6.0, v + 0.02)
+            sample(MotionState.MOVING, v, 0.0, 0.2, vibration = 0.4)
+            if (firstMoveSec < 0 && nav.currentLat != stopLat) firstMoveSec = k / 10.0
+        }
+        assertTrue("first moved after $firstMoveSec s", firstMoveSec in 5.0..12.0)
+    }
+
+    @Test
+    fun idlingAfterAShortDriveStaysPut() {
+        repeat(10) { repeat(10) { sample(MotionState.MOVING, 10.0, 0.0, vibration = 0.4) }; fix(10f, 0f) }
+        repeat(3) { repeat(10) { k -> sample(MotionState.STATIONARY, stillForMs = (k + 1) * 100L, vibration = 0.03) }; fix(0f, 0f) }
+        nav.onGpsLost(clock)
+        repeat(100) { k -> sample(MotionState.STATIONARY, stillForMs = 3_000L + (k + 1) * 100L, vibration = 0.03) }
+        val stopLat = nav.currentLat
+        repeat(900) { sample(MotionState.MOVING, vibration = 0.1) } // engine idling, phone says moving
+        assertEquals(stopLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aPullAwayTooGentleToMeasureIsFoundFromTheVibration() {
+        driveStopAndLoseEverything(standSec = 20)
+        val stopLat = nav.currentLat
+        var v = 0.0; var travelled = 0.0; var firstMoveSec = -1.0
+        repeat(600) { k ->
+            val accel = if (v < 6.0) 0.2 else 0.0
+            v = min(6.0, v + accel * 0.1); travelled += v * 0.1
+            sample(MotionState.MOVING, v, 0.0, accel, vibration = 0.4)
+            if (firstMoveSec < 0 && nav.currentLat != stopLat) firstMoveSec = k / 10.0
+        }
+        assertTrue("first moved after $firstMoveSec s", firstMoveSec in 5.0..12.0)
+        val marker = (nav.currentLat - stopLat) * 111_195.0
+        assertTrue("marker $marker of $travelled m", marker in 0.7 * travelled..1.5 * travelled)
+    }
+
+    @Test
+    fun idlingBelowDrivingVibrationStaysPut() {
+        driveStopAndLoseEverything(standSec = 5)
+        val stopLat = nav.currentLat
+        repeat(900) { sample(MotionState.MOVING, vibration = 0.2) } // above the drop, below driving level
+        assertEquals(stopLat, nav.currentLat, 1e-9)
+        assertEquals(0.0, nav.state().speedMps, 1e-9)
+    }
+
+    @Test
+    fun knocksAtDrivingVibrationDoNotAddUpToARestart() {
+        driveStopAndLoseEverything(standSec = 5)
+        val stopLat = nav.currentLat
+        repeat(4) {
+            repeat(60) { sample(MotionState.MOVING, vibration = 0.4) } // 6 s of shaking
+            repeat(30) { k -> sample(MotionState.STATIONARY, stillForMs = (k + 1) * 100L, vibration = 0.03) }
+        }
+        assertEquals(stopLat, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun gpsFixesWithNoSatellitesAreEstimatesNotGps() {
+        driveWithGps(10, 10.0, 0.0)
+        fun estimate() = nav.onLocationFix(GpsPoint(lat, lon, 50f, clock, 10f, 0f, hasSpeed = true, hasBearing = true,
+            elapsedRealtimeMs = clock, isGnss = false, isChipEstimate = true), clock)
+        repeat(2) {
+            repeat(10) { sample(MotionState.MOVING, 10.0, 0.0) }
+            assertEquals("ignored: GPS is working", estimate())
+        }
+        repeat(10) { repeat(10) { sample(MotionState.MOVING, 10.0, 0.0) }; estimate() }
+        assertFalse("no satellites is not GPS", nav.state().gpsAvailable)
+        assertEquals(PositionSource.ESTIMATE, nav.state().source)
+        assertTrue("off by ${distanceFromTruth()} m", distanceFromTruth() < 40.0)
+    }
+
+    @Test
+    fun everyNetworkFixSaysWhatBecameOfIt() {
+        driveWithGps(5, 10.0, 0.0)
+        assertEquals("ignored: GPS is working", network())
+        assertEquals("ignored: accuracy too poor", network(accuracy = 3000f))
+        stopAndLoseEverything(standSec = 5, bearing = 0.0)
+        assertEquals("ignored: stopped", network())
+        var v = 0.0
+        repeat(80) { v += 0.15; sample(MotionState.MOVING, v, 0.0, accel = 1.5) }
+        assertEquals("used", network())
+    }
 
     @Test
     fun aWholeDriveGivesNewCoordinatesWhileMovingAndTheSameOnlyWhileStopped() {
@@ -201,9 +441,9 @@ class NoGpsDrivingTest {
         // location says so, ±50 m. The standing estimate's error does not grow, so it used to
         // reject the network for ever.
         GeoToolbox.moveLocation(lat, lon, 600.0, 0.0).let { (a, b) -> lat = a; lon = b }
-        clock += 1000; fix(0f, 0f, accuracy = 50f, isGnss = false)
+        clock += 1000; lat += 0.00001; fix(0f, 0f, accuracy = 50f, isGnss = false)
         assertEquals("one far fix is an outlier", stuckLat, nav.currentLat, 1e-9)
-        repeat(2) { clock += 1000; fix(0f, 0f, accuracy = 50f, isGnss = false) }
+        repeat(2) { clock += 1000; lat += 0.00001; fix(0f, 0f, accuracy = 50f, isGnss = false) } // fresh fixes, not one fix repeated
         assertTrue("off by ${distanceFromTruth()} m", distanceFromTruth() < 60.0)
         assertEquals(PositionSource.NETWORK, nav.state().source)
     }

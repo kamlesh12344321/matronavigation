@@ -23,7 +23,6 @@ data class MotionSample(
     /** Mean horizontal linear acceleration in world frame (m/s²); 0 when orientation is unknown. */
     val accelEast: Double,
     val accelNorth: Double,
-    val pressureRapidChange: Boolean = false,
     /**
      * True when [accelEast]/[accelNorth] are real world-frame values (orientation sensor
      * working). Enables the braking / departure checks on stops; false keeps the simpler model.
@@ -36,7 +35,30 @@ data class MotionSample(
      */
     val yawRateDps: Double = Double.NaN,
     /** Spread of the acceleration over ~2 s (m/s²): road / engine / track vibration; NaN while warming up. */
-    val vibration: Double = Double.NaN
+    val vibration: Double = Double.NaN,
+    /** Steps the phone's step detector reported in this window. */
+    val steps: Int = 0,
+    /** Height change from the barometer (m); NaN without one. */
+    val heightMeters: Double = Double.NaN
+)
+
+/** The ride so far, saved every few seconds so it can go on if the app is restarted. Not kept between rides. */
+data class RideState(
+    val routeId: String?,
+    val latitude: Double,
+    val longitude: Double,
+    val distanceAlongLine: Double,
+    val direction: Int,
+    val directionKnown: Boolean,
+    val directionUnconfirmed: Boolean,
+    val headingDeg: Double,
+    val speedMps: Double,
+    val cruiseSpeedMps: Double,
+    val uncertaintyMeters: Double,
+    val lastStation: String?,
+    val savedAtMs: Long,
+    val inVehicle: Boolean = true,
+    val headingKnown: Boolean = true
 )
 
 enum class PositionSource(val label: String) {
@@ -45,6 +67,8 @@ enum class PositionSource(val label: String) {
     GPS("GPS"),
     /** Network location (Google fused: Wi-Fi and mobile cell towers), used when there is no satellite fix. */
     NETWORK("NET"),
+    /** GPS provider fix with no satellite in use: the phone chip's own estimate, ranked with network. */
+    ESTIMATE("GPS-EST"),
     /** Estimated position constrained to a metro track. */
     TRACK("TRACK"),
     /** Heading + distance estimate without a track. */
@@ -56,9 +80,12 @@ data class NavState(
     val longitude: Double = 0.0,
     val source: PositionSource = PositionSource.NONE,
     val gpsAvailable: Boolean = false,
-    val underground: Boolean = false,
     val speedMps: Double = 0.0,
     val headingDeg: Double = 0.0,
+    /** False until something has measured the heading; [headingDeg] means nothing before that. */
+    val headingKnown: Boolean = false,
+    /** Height from the last GPS fix; null without GPS. */
+    val gpsAltitudeMeters: Double? = null,
     val motion: MotionState = MotionState.STATIONARY,
     val gpsLostForMs: Long = 0,
     val distanceSinceGpsLossMeters: Double = 0.0,
@@ -91,8 +118,8 @@ data class NavState(
  * Position engine for GPS-denied travel (metro tunnels), also used while GPS is fine.
  *
  * Inputs: satellite fixes, network fixes (Google fused: Wi-Fi and cell towers), "GPS lost"
- * signals and IMU motion samples. Output: [state]. Nothing is saved between rides: every ride
- * starts from the line data and the sensors alone.
+ * signals and IMU motion samples. Output: [state]. Nothing is learnt or kept between rides: every
+ * ride starts from the line data and the sensors alone ([rideState] only bridges an app restart).
  *
  * Source order: a good satellite fix is the position. When there has been no good fix for
  * [GOOD_GPS_TIMEOUT_MS] (lost, or too poor), GPS counts as lost: poor satellite fixes and
@@ -145,6 +172,7 @@ class UndergroundNavigator {
     private var rejectStreak = 0
     private var recoveryCandidate: GpsPoint? = null
     private var lastAccuracy: Float? = null
+    private var lastAltitude: Double? = null
     private var mock = false
 
     // Motion
@@ -159,19 +187,30 @@ class UndergroundNavigator {
     private val speedForError: Double get() = if (cruiseLearnt) speed else max(speed, cruiseSpeed)
     private var heading = 0.0
     private var motion = MotionState.STATIONARY
-    private var pressureRapid = false
 
     // Track
     private var onTrack = false
     private var navDist = 0.0
     private var direction = 1
     private var directionKnown = false
+    /** The direction rests on the compass alone (no GPS, destination or line end): curves and network fixes may overrule it. */
+    private var directionUnconfirmed = false
+    /** Where the direction was set: if it was wrong, the train went the other way from here. */
+    private var directionSetAt = 0.0
+    /** Just restarted: seconds of motion still needed before the braking history can prove a stop. */
+    private var resumeHistoryMissingSec = 0.0
+    /** Network fixes in a row that fit the opposite direction. */
+    private var oppositeFixes = 0
+    /** Leaving the end of the line: there is only one way to go, whatever the compass says. */
+    private var directionCertain = false
     private var destination: MetroStation? = null
     private var heldAt: MetroStation? = null
     private var holdAllowance = 0.0
     private var pendingOvershoot = 0.0
     /** How far the held estimate has crept on (the train is still moving, so its position must too). */
     private var holdCreep = 0.0
+    /** How far before the station the slow-down starts. */
+    private var holdMargin = HOLD_MARGIN_METERS
     private var holdStartMs = 0L
     private var holdStartSpeed = 0.0
     /** World-frame acceleration available in the latest motion sample (braking can be measured). */
@@ -245,6 +284,10 @@ class UndergroundNavigator {
     private var quietSinceMs = 0L
     /** The current still reading comes from the vibration drop, not from the phone's own still detection. */
     private var stillFromVibrationDrop = false
+    /** The phone reads still, by its own detection or by the vibration drop (also while GPS works). */
+    private var phoneStill = false
+    /** Accuracy of the fix the position was last taken from. */
+    private var positionAccuracy = Float.MAX_VALUE
     /** Recent bias-corrected turn rates (°/s), to tell a turning vehicle from a standing one. */
     private val recentYaw = ArrayDeque<Double>()
     private var gnssAccelSign = 0
@@ -258,6 +301,34 @@ class UndergroundNavigator {
     /** False after an accepted stop until acceleration shows the vehicle really pulled away. */
     private var motionConfirmed = true
     private var unconfirmedMovingSec = 0.0
+    private var drivingVibrationSec = 0.0
+
+    // Barometer: in a tunnel a moving train keeps the pressure changing, a standing one does not
+    private val heightHistory = ArrayDeque<DoubleArray>()
+    private var pressureSteady = false
+    private var pressureSteadySinceMs = 0L
+    /** This sample counts as standing because of the pressure, whatever the shaking says (a phone in the hand). */
+    private var stillFromPressure = false
+    /** The train is standing by the pressure: when that changes, it has left. */
+    private var stoppedByPressure = false
+    /** How long the pressure has kept changing: a single step (doors) passes, a departure goes on. */
+    private var pressureMovingSec = 0.0
+
+    private var lastWeakLat = Double.NaN
+    private var lastWeakLon = Double.NaN
+    /** Vibration at this ride's stops: the reference when it has not driven long enough to know its driving level. */
+    private var standingVibration = Double.NaN
+
+    // On foot: the step detector moves the estimate, one stride per step, learnt from GPS in this walk
+    private var strideMeters = DEFAULT_STRIDE_METERS
+    private var strideLearnMeters = 0.0
+    private var strideLearnSteps = 0
+    private var lastStepMs = 0L
+    private var stepGapMs = 0L
+    /** Steps in a row, without a pause. */
+    private var stepRun = 0
+    private var onFoot = false
+    private val walkingNow: Boolean get() = !inVehicle && lastStepMs != 0L && nowMs - lastStepMs <= STEP_PAUSE_MS
 
     // Odometer: the run since the last trusted station stop
     private var segmentStart: MetroStation? = null
@@ -292,6 +363,8 @@ class UndergroundNavigator {
     /** Turn rate smoothed over ~2 s (single gyro readings are noisy). */
     private var yawSmoothed = 0.0
     private var curveCorrections = 0
+    /** How long the turn rate has been too fast for a train (a single reading can be a jolt over points). */
+    private var handlingSec = 0.0
 
     /** Messages worth logging (station stops, GPS lost/recovered, line changes); drained by the caller. */
     val events = mutableListOf<String>()
@@ -317,7 +390,7 @@ class UndergroundNavigator {
         if (hasPosition) {
             val p = r.project(lat, lon)
             val radius = if (gpsAvailable) LOCK_RADIUS_METERS + (lastAccuracy ?: 0f) else LOST_LOCK_RADIUS_METERS
-            if (p.offsetMeters <= radius) {
+            if (p.offsetMeters <= radius && !walkingNow) {
                 navDist = p.distanceAlongTrack
                 onTrack = true
                 val fix = lastAccepted
@@ -341,34 +414,76 @@ class UndergroundNavigator {
             if (onTrack && abs(d.distanceAlongTrack - navDist) > DESTINATION_MIN_DISTANCE_METERS) {
                 val newDir = if (d.distanceAlongTrack > navDist) 1 else -1
                 if (newDir != direction) clearHold()
-                direction = newDir
-                directionKnown = true
+                setDirection(newDir)
                 flushUndirected(r)
             }
         }
     }
 
     fun flipDirection() {
-        direction = -direction
-        directionKnown = true
+        setDirection(-direction)
         destination = null
         clearHold()
         route?.let { flushUndirected(it) }
     }
 
+    /** The ride to save for [resume]; null while GPS works (nothing to recover) or without a position. */
+    fun rideState(wallClockMs: Long): RideState? = if (gpsAvailable || !hasPosition) null else RideState(
+        route?.takeIf { onTrack }?.id, lat, lon, navDist, direction, directionKnown, directionUnconfirmed,
+        heading, speed, cruiseSpeed, uncertainty, lastStopStation?.name, wallClockMs, inVehicle, headingKnown
+    )
+
+    /**
+     * Goes on from [s] after the app was restarted [gapSec] ago, on its line [r] if that is on the
+     * phone. The train may have moved or stopped meanwhile, so the position is carried on at the
+     * saved speed, the error grows, and the next stop puts it right. Only GPS beats the saved
+     * ride: a network fix that came first is far coarser and knows no line or direction.
+     */
+    fun resume(s: RideState, r: MetroRoute?, gapSec: Double, elapsedMs: Long) {
+        if (gpsAvailable) return
+        nowMs = elapsedMs
+        lat = s.latitude; lon = s.longitude
+        hasPosition = true
+        gpsLostAtMs = elapsedMs
+        heading = s.headingDeg; headingKnown = s.headingKnown
+        speed = s.speedMps
+        cruiseSpeed = s.cruiseSpeedMps; cruiseEvidence = CRUISE_EVIDENCE_NEEDED
+        inVehicle = s.inVehicle
+        motionConfirmed = speed >= STANDING_AT_LOSS_MPS // standing: only a real pull-away moves it
+        resumeHistoryMissingSec = DV_HISTORY_MS / 1000.0
+        uncertainty = s.uncertaintyMeters + gapSec * max(speed, cruiseSpeed) * RESUME_GAP_ERROR_FRACTION
+        val carried = speed * min(gapSec, RESUME_MAX_CARRY_SEC)
+        if (r != null) {
+            route = r
+            onTrack = true
+            navDist = s.distanceAlongLine
+            direction = s.direction; directionKnown = s.directionKnown; directionUnconfirmed = s.directionUnconfirmed
+            directionSetAt = navDist
+            lastStopStation = r.stations.firstOrNull { it.name == s.lastStation }
+            applyTrackPosition(r)
+            if (motionConfirmed) advanceAlongTrack(r, carried)
+        } else {
+            if (motionConfirmed) GeoToolbox.moveLocation(lat, lon, carried, heading).let { (a, b) -> lat = a; lon = b }
+            source = PositionSource.DEAD_RECKONING
+        }
+        events.add(String.format(Locale.US, "Ride resumed after a restart (%.0f s gap, ±%.0f m)", gapSec, uncertainty))
+    }
+
     // ---- Location input ----------------------------------------------------------------------
 
-    /** Satellite or network fix. [elapsedMs] is the caller's monotonic clock. */
-    fun onLocationFix(fix: GpsPoint, elapsedMs: Long) {
+    /** Satellite or network fix; [elapsedMs] is the caller's monotonic clock. Says what became of it, for the log. */
+    fun onLocationFix(fix: GpsPoint, elapsedMs: Long): String {
         nowMs = elapsedMs
-        if (fix.accuracy <= 0f || fix.accuracy > MAX_USABLE_ACCURACY_METERS) return
-        if (fix.latitude.isNaN() || fix.longitude.isNaN()) return
-        if (fix.latitude !in -90.0..90.0 || fix.longitude !in -180.0..180.0) return
-        if (fix.latitude == 0.0 && fix.longitude == 0.0) return
-        if (fix.isGnss && fix.accuracy <= GNSS_GOOD_ACCURACY_METERS) handleGnss(fix) else {
-            checkGpsTooPoor()
-            handleWeak(fix)
+        if (fix.accuracy <= 0f || fix.accuracy > MAX_USABLE_ACCURACY_METERS) return "ignored: accuracy too poor"
+        if (fix.latitude.isNaN() || fix.longitude.isNaN()) return "ignored: bad coordinates"
+        if (fix.latitude !in -90.0..90.0 || fix.longitude !in -180.0..180.0) return "ignored: bad coordinates"
+        if (fix.latitude == 0.0 && fix.longitude == 0.0) return "ignored: bad coordinates"
+        if (fix.isGnss && fix.accuracy <= GNSS_GOOD_ACCURACY_METERS) {
+            handleGnss(fix)
+            return "used"
         }
+        checkGpsTooPoor()
+        return handleWeak(fix)
     }
 
     /**
@@ -413,6 +528,7 @@ class UndergroundNavigator {
         recoveryCandidate = null
 
         gpsAvailable = true
+        onFoot = false
         snappedAtStation = false
         resetSegment()
         lastGnssMs = nowMs
@@ -426,6 +542,7 @@ class UndergroundNavigator {
         clearHold()
         lastAccepted = fix
         lastAccuracy = fix.accuracy
+        lastAltitude = fix.altitudeMeters
         mock = fix.isMock
 
         val fixSpeed = if (fix.hasSpeed) fix.speedMeterPerSecond.toDouble() else speed
@@ -438,13 +555,18 @@ class UndergroundNavigator {
             cruiseEvidence++
         }
 
-        // Every accepted fix is the position: holding the old one while slow froze it (fixes
-        // without speed counted as slow), so the log and map repeated one point.
-        lat = fix.latitude; lon = fix.longitude
+        // Every accepted fix is the position, unless the vehicle really stands: then GPS noise
+        // (a few metres) must not move it. That takes both the phone reading still and GPS
+        // measuring no speed; slow is not enough, or a slow vehicle's position would freeze.
+        if (!standingWithGps(fix)) {
+            lat = fix.latitude; lon = fix.longitude
+            positionAccuracy = fix.accuracy
+        }
         hasPosition = true
         source = PositionSource.GPS
         uncertainty = fix.accuracy.toDouble()
-        if (fix.hasBearing && fixSpeed > 1.5) { heading = fix.bearingDegree.toDouble(); headingKnown = true }
+        val minCourseSpeed = if (inVehicle) 1.5 else WALK_COURSE_MIN_MPS // on foot the course is needed at walking pace
+        if (fix.hasBearing && fixSpeed > minCourseSpeed) { heading = fix.bearingDegree.toDouble(); headingKnown = true }
         // Speeding up / braking with a known GPS course: the measured acceleration direction
         // tells the compass error (see onMotion, which uses gnssAccelSign).
         gnssAccelSign = 0
@@ -467,19 +589,35 @@ class UndergroundNavigator {
         navDist = p.distanceAlongTrack
         if (destination == null) {
             if (fix.hasBearing && fixSpeed > 2.0) inferDirectionFromBearing(fix.bearingDegree.toDouble())
-            else if (prevProj != null && abs(navDist - prevProj) > 20.0) { direction = if (navDist > prevProj) 1 else -1; directionKnown = true }
+            else if (prevProj != null && abs(navDist - prevProj) > 20.0 && fixSpeed > DIRECTION_FROM_MOTION_MIN_MPS) setDirection(if (navDist > prevProj) 1 else -1)
         }
         if (prevProj == null || abs(navDist - prevProj) > 20.0) lastTrackProjection = navDist
     }
 
+    /** Hold the coordinates? Not if the fix is clearly better, or too far away to be noise. */
+    private fun standingWithGps(fix: GpsPoint): Boolean =
+        hasPosition && source == PositionSource.GPS && phoneStill &&
+            fix.hasSpeed && fix.speedMeterPerSecond < GPS_STANDING_MPS &&
+            fix.accuracy > GPS_BETTER_FIX_FRACTION * positionAccuracy &&
+            GeoToolbox.calculateDistance(lat, lon, fix.latitude, fix.longitude) <= max(GPS_NOISE_METERS, 2.0 * fix.accuracy)
+
     /**
-     * Network fix (Google fused: Wi-Fi / cell towers), or a satellite fix too poor / not yet
-     * confirmed to trust fully. Second in line after a good satellite fix.
+     * Network fix (Google fused: Wi-Fi / cell towers), a GPS fix with no satellites, or a satellite
+     * fix too poor / not yet confirmed to trust fully. Second in line after a good satellite fix.
+     * Returns what became of it.
      */
-    private fun handleWeak(fix: GpsPoint) {
-        if (gpsAvailable) return // a real satellite fix is better
+    private fun handleWeak(fix: GpsPoint): String {
+        // The same coordinates again, usually with a growing accuracy, are an old fix: nothing new.
+        val repeated = !fix.isGnss && abs(fix.latitude - lastWeakLat) < SAME_FIX_DEGREES && abs(fix.longitude - lastWeakLon) < SAME_FIX_DEGREES
+        if (!fix.isGnss) { lastWeakLat = fix.latitude; lastWeakLon = fix.longitude }
+        if (gpsAvailable) return "ignored: GPS is working" // a real satellite fix is better
+        if (repeated && hasPosition) return "ignored: repeat of the last fix"
         if (fix.isMock) mock = true
-        val r = max(fix.accuracy.toDouble(), 10.0) * WEAK_ACCURACY_INFLATION
+        val weakSource = if (fix.isChipEstimate) PositionSource.ESTIMATE else PositionSource.NETWORK
+        // Round accuracies are mobile-cell positions. On the real ride they claimed ±100 m and were 1.2 km off.
+        val coarse = !fix.isGnss && !fix.isChipEstimate && fix.accuracy >= 100f && abs(fix.accuracy - 100f * kotlin.math.round(fix.accuracy / 100f)) < 0.5f
+        val accuracy = if (coarse) max(fix.accuracy, COARSE_FIX_ACCURACY_METERS) else fix.accuracy
+        val r = max(accuracy.toDouble(), 10.0) * WEAK_ACCURACY_INFLATION
         if (fix.isGnss && fix.hasSpeed && fix.accuracy <= WEAK_GNSS_SPEED_MAX_ACCURACY_METERS && hasPosition) {
             // A poor satellite fix still measures speed and course well (Doppler): use them gently.
             val trueSpeed = fix.speedMeterPerSecond.toDouble().coerceIn(0.0, MAX_SPEED_MPS)
@@ -493,76 +631,105 @@ class UndergroundNavigator {
         if (!hasPosition) {
             lat = fix.latitude; lon = fix.longitude
             hasPosition = true
-            source = PositionSource.NETWORK
+            source = weakSource
             uncertainty = r
             route?.let { rt ->
                 val p = rt.project(lat, lon)
                 if (p.offsetMeters <= min(fix.accuracy + 50.0, LOST_LOCK_RADIUS_METERS)) { onTrack = true; navDist = p.distanceAlongTrack }
             }
-            return
+            return "used: first position"
         }
 
         val rt = route
         if (rt != null) {
             val p = rt.project(fix.latitude, fix.longitude)
             if (!onTrack) {
-                if (p.offsetMeters <= min(fix.accuracy + 50.0, LOST_LOCK_RADIUS_METERS)) {
+                if (p.offsetMeters <= min(fix.accuracy + 50.0, LOST_LOCK_RADIUS_METERS) && !walkingNow) {
                     onTrack = true
                     navDist = p.distanceAlongTrack
                     uncertainty = r
                     applyTrackPosition(rt)
                     events.add("Locked to ${rt.lineName} using network location")
-                    return
+                    return "used: locked to the line"
                 }
             } else {
+                // The chip's guess carries on from the last GPS fix: it knows nothing the line does not.
+                if (fix.isChipEstimate) return "ignored: on the line"
                 // Standing at a known platform is better than any network fix; standing anywhere,
                 // the coordinates stay the same until the train moves (the fix is used then).
-                if (snappedAtStation || standing) return
-                if (p.offsetMeters > fix.accuracy + WEAK_OFF_TRACK_TOLERANCE_METERS) return // not consistent with the line
+                if (p.offsetMeters > accuracy + WEAK_OFF_TRACK_TOLERANCE_METERS) return "ignored: off the line"
                 val innovation = p.distanceAlongTrack - navDist
-                if (abs(innovation) > WEAK_GATE_SIGMAS * sqrt(uncertainty * uncertainty + r * r)) return // outlier
+                val stopped = snappedAtStation || standing
+                val far = abs(innovation) > WEAK_GATE_SIGMAS * sqrt(uncertainty * uncertainty + r * r)
+                if (stopped && !far) return "ignored: stopped"
+                if (!stopped && directionUnconfirmed) {
+                    // Clearly closer to where the train would be going the other way?
+                    val fitsOpposite = abs(p.distanceAlongTrack - (2 * directionSetAt - navDist)) + fix.accuracy < abs(innovation)
+                    oppositeFixes = if (fitsOpposite) oppositeFixes + 1 else 0
+                    if (oppositeFixes >= WEAK_REJECT_RESET_COUNT) { correctDirection(rt, "network location"); return "used: corrected the direction" }
+                }
+                if (far) {
+                    // One such fix is an outlier; several good ones that agree mean the estimate is wrong.
+                    if (coarse || !agreesWithLastRejected(fix)) return "ignored: too far from the estimate"
+                    events.add(String.format(Locale.US, "Network location disagreed %d times in a row: estimate was off by %.0f m along the line, moved to it", weakRejects, abs(innovation)))
+                    weakRejects = 0
+                    lastRejectedWeak = null
+                    navDist = p.distanceAlongTrack
+                    uncertainty = r
+                    clearHold()
+                    resetSegment()
+                    networkCorrections++
+                    applyTrackPosition(rt)
+                    return "used: moved to it"
+                }
                 val k = (uncertainty * uncertainty) / (uncertainty * uncertainty + r * r)
                 navDist = (navDist + k * innovation).coerceIn(0.0, rt.length)
                 uncertainty = sqrt(uncertainty * uncertainty * r * r / (uncertainty * uncertainty + r * r))
                 heldAt?.let { if (direction * (navDist - it.distanceAlongTrack) > 0) clearHold() }
                 networkCorrections++
                 applyTrackPosition(rt)
-                return
+                return "used"
             }
         }
 
         // Free-space blend (no line): trust network more as our own estimate degrades.
         val d = GeoToolbox.calculateDistance(lat, lon, fix.latitude, fix.longitude)
-        if (source != PositionSource.NETWORK && d > WEAK_GATE_SIGMAS * sqrt(uncertainty * uncertainty + r * r)) {
+        if (source != weakSource && d > WEAK_GATE_SIGMAS * sqrt(uncertainty * uncertainty + r * r)) {
             // Far from our estimate. One such fix is an outlier; several that agree with each
             // other mean our estimate has drifted (wrong heading, a missed stop or start), and
             // without this it would reject the network for ever while standing (its error does
             // not grow at a stop).
-            val prev = lastRejectedWeak
-            val agrees = prev != null && GeoToolbox.calculateDistance(prev.latitude, prev.longitude, fix.latitude, fix.longitude) <=
-                prev.accuracy + fix.accuracy + max(speed, 5.0) * max(0.0, (fix.elapsedRealtimeMs - prev.elapsedRealtimeMs) / 1000.0)
-            weakRejects = if (agrees) weakRejects + 1 else 1
-            lastRejectedWeak = fix
-            if (weakRejects < WEAK_REJECT_RESET_COUNT) return
+            if (!agreesWithLastRejected(fix)) return "ignored: too far from the estimate"
             events.add(String.format(Locale.US, "Network location disagreed %d times in a row: estimate was off by %.0f m, moved to it", weakRejects, d))
             // (Even while standing: a clear, repeated disagreement means the estimate is wrong.)
             weakRejects = 0
             lastRejectedWeak = null
             lat = fix.latitude; lon = fix.longitude
             uncertainty = r
-            source = PositionSource.NETWORK
+            source = weakSource
             networkCorrections++
-            return
+            return "used: moved to it"
         }
         weakRejects = 0
         lastRejectedWeak = null
-        if (standing) return // stopped: the same coordinates until it moves, not network noise
+        if (standing) return "ignored: stopped" // the same coordinates until it moves, not network noise
         val k = (uncertainty * uncertainty) / (uncertainty * uncertainty + r * r)
         lat += k * (fix.latitude - lat)
         lon += k * (fix.longitude - lon)
         uncertainty = sqrt(uncertainty * uncertainty * r * r / (uncertainty * uncertainty + r * r))
         networkCorrections++
-        if (k >= 0.5) source = PositionSource.NETWORK
+        if (k >= 0.5 || fix.isChipEstimate) source = weakSource
+        return "used"
+    }
+
+    /** Counts [fix] among the rejected ones; true once enough of them in a row agree with each other. */
+    private fun agreesWithLastRejected(fix: GpsPoint): Boolean {
+        val prev = lastRejectedWeak
+        val agrees = prev != null && GeoToolbox.calculateDistance(prev.latitude, prev.longitude, fix.latitude, fix.longitude) <=
+            prev.accuracy + fix.accuracy + max(speed, 5.0) * max(0.0, (fix.elapsedRealtimeMs - prev.elapsedRealtimeMs) / 1000.0)
+        weakRejects = if (agrees) weakRejects + 1 else 1
+        lastRejectedWeak = fix
+        return weakRejects >= WEAK_REJECT_RESET_COUNT
     }
 
     /** No satellite fix for a while (the caller's watchdog decides how long, or [checkGpsTooPoor]). */
@@ -582,6 +749,7 @@ class UndergroundNavigator {
             // vibration that the phone reads as "moving".
             motionConfirmed = false
             unconfirmedMovingSec = 0.0
+            drivingVibrationSec = 0.0
             dvHistory.clear()
             velE = 0.0; velN = 0.0; velPeak = 0.0; velKnown = true; velSeconds = 0.0
             speed = 0.0
@@ -592,7 +760,8 @@ class UndergroundNavigator {
         // forward over that gap at the last known speed.
         val gapSec = if (lastGnssMs > 0) ((elapsedMs - lastGnssMs) / 1000.0).coerceIn(0.0, MAX_GAP_SEC) else 0.0
         val r = route
-        if (r != null && !onTrack) {
+        if (walkingNow) onTrack = false // someone on foot beside the line, not a train on it
+        if (r != null && !onTrack && !walkingNow) {
             val p = r.project(lat, lon)
             if (p.offsetMeters <= LOST_LOCK_RADIUS_METERS) { onTrack = true; navDist = p.distanceAlongTrack }
         }
@@ -640,11 +809,10 @@ class UndergroundNavigator {
         }
         val turning = vehicleTurning(input)
         checkGpsTooPoor()
-        val raw = motionStateOf(input, turning, dt)
+        val raw = stateWithPressure(motionStateOf(input, turning, dt))
         // Remove the accelerometer bias measured while the train stood still.
         val sample = if (raw.orientationKnown) raw.copy(accelEast = raw.accelEast - accBiasE, accelNorth = raw.accelNorth - accBiasN) else raw
         motion = sample.state
-        pressureRapid = sample.pressureRapidChange
         accelMeasured = sample.orientationKnown
         if (sample.state == MotionState.WALKING) walkingSeconds += dt else walkingSeconds = 0.0
         if (gpsAvailable && gnssAccelSign != 0 && sample.orientationKnown) {
@@ -655,14 +823,28 @@ class UndergroundNavigator {
                 learnCompassOffset(measured, travel, COMPASS_LEARN_RATE_GPS)
             }
         }
+        if (sample.steps > 0) noteSteps(sample)
         if (gpsAvailable) {
             // A long walk at walking pace ends the ride; a vehicle that merely stops is still one.
             if (walkingSeconds >= WALK_ENDS_RIDE_SEC && speed < WALKING_MAX_MPS) inVehicle = false
+            if (sample.steps > 0) learnStride(sample)
             return
         }
         if (!hasPosition) return
+        if (onTrack && walkingNow && stepRun >= STEPS_TO_LEAVE_LINE) { // walking beside the line, not riding it
+            onTrack = false
+            clearHold()
+            events.add("On foot: left ${route?.lineName ?: "the line"}")
+        }
+        if (!inVehicle && route?.takeIf { onTrack } == null &&
+            (sample.steps > 0 || (onFoot && sample.elapsedMs - lastStepMs <= STEP_PAUSE_MS))) {
+            followSteps(sample, dt)
+            return
+        }
+        if (onFoot) { onFoot = false; speed = 0.0 } // stopped walking
 
         var state = sample.state
+        if (state != MotionState.STATIONARY) resumeHistoryMissingSec = max(0.0, resumeHistoryMissingSec - dt)
         if (sample.orientationKnown) {
             if (state != MotionState.STATIONARY) {
                 recordDv(sample, dt)
@@ -675,7 +857,7 @@ class UndergroundNavigator {
                 if (sample.stationaryForMs <= STILL_VERIFY_GRACE_MS || speedAtStill == 0.0) speedAtStill = max(speedAtStill, speed)
                 // No departure confirmed since the last stop: the vehicle is still standing there (the
                 // motion in between was the box being knocked), so there is nothing to verify.
-                val braked = !motionConfirmed || if (velKnown) {
+                val braked = !motionConfirmed || resumeHistoryMissingSec > 0.0 || if (velKnown) {
                     // Integrated velocity since the last stop: back near zero only if we really stopped.
                     // Allowance grows with the run time: residual bias integrates into velocity. After
                     // a long run (or a missed stop) that drift can exceed it: the recent braking, which
@@ -690,7 +872,7 @@ class UndergroundNavigator {
                 // proof (sensor trouble); a vibration drop never is: a quiet stretch of smooth running
                 // looks the same.
                 val longStill = !stillFromVibrationDrop && sample.stationaryForMs >= LONG_STILL_ACCEPT_MS
-                if (braked || longStill) {
+                if (braked || longStill || stillFromPressure) {
                     stillAccepted = true
                     speedAtStill = 0.0
                     dvHistory.clear()
@@ -707,6 +889,11 @@ class UndergroundNavigator {
             MotionState.STATIONARY -> {
                 speed = 0.0
                 speedAtStill = 0.0
+                if (stillFromPressure) stoppedByPressure = true
+                if (!sample.vibration.isNaN()) {
+                    standingVibration = if (standingVibration.isNaN()) sample.vibration
+                        else standingVibration + (sample.vibration - standingVibration) * min(1.0, dt / STANDING_VIBRATION_TAU_SEC)
+                }
                 if (raw.orientationKnown && stillAccepted && sample.stationaryForMs >= BIAS_LEARN_AFTER_STILL_MS) {
                     // Standing still (braking confirmed): whatever horizontal acceleration is measured
                     // on average is sensor bias — engine or air-conditioning vibration averages out.
@@ -719,7 +906,7 @@ class UndergroundNavigator {
                 }
                 // After a stop only a real departure moves the estimate again. On a line without an
                 // orientation sensor there is nothing to measure it with, so the line's model resumes.
-                if (sample.orientationKnown || route?.takeIf { onTrack } == null) { motionConfirmed = false; unconfirmedMovingSec = 0.0 }
+                if (sample.orientationKnown || route?.takeIf { onTrack } == null) { motionConfirmed = false; unconfirmedMovingSec = 0.0; drivingVibrationSec = 0.0 }
                 startDepartureWatch() // restart the window: the departure begins after the last still moment
                 val r = route?.takeIf { onTrack }
                 if (r != null && !stopHandled && sample.stationaryForMs >= STATION_STOP_MS) {
@@ -734,10 +921,14 @@ class UndergroundNavigator {
                     // Someone walking on the platform or inside the carriage, or the box being
                     // carried: footsteps hide the train's own acceleration, so it keeps the speed it
                     // had (0 at a platform, its running speed in a moving train).
-                } else if (inVehicle && (motionConfirmed || confirmDeparture(dt, turning, onLine = false))) {
+                } else if (inVehicle && (motionConfirmed || confirmDeparture(dt, turning, onLine = false, sample.vibration))) {
                     // Strong vibration in a vehicle (rough road, rattling mount) is not walking:
                     // the vehicle model goes on. A pull-away still needs its velocity change.
                     vehicleSpeedModel(sample, dt)
+                } else if (!inVehicle && headingKnown && walkingSeconds >= WALK_WITHOUT_STEPS_SEC) {
+                    // Shaking like walking, but no steps reported (no step sensor, or no permission).
+                    onFoot = true
+                    speed = strideMeters * WALK_CADENCE_HZ
                 } else {
                     // On foot, or a vehicle not yet seen pulling away: no motion is invented.
                     speed = 0.0
@@ -752,9 +943,9 @@ class UndergroundNavigator {
                 if (!motionConfirmed && (r != null || inVehicle)) {
                     // After a stop: jiggling the phone or engine vibration is not a departure. On a
                     // line, long moving vibration resumes the model (the stop was probably a glide
-                    // mis-read as still, and the stations bound the error); on a road it would run
-                    // away at every long red light.
-                    if (!confirmDeparture(dt, turning, onLine = r != null)) speed = 0.0
+                    // mis-read as still, and the stations bound the error); on a road only vibration
+                    // at this ride's driving level does, or it would run away at every long red light.
+                    if (!confirmDeparture(dt, turning, onLine = r != null, sample.vibration)) speed = 0.0
                 } else if (r != null) {
                     // On a metro line: IMU acceleration along the track + pull toward the cruise
                     // speed of this ride, fused with the inertial speed.
@@ -769,9 +960,9 @@ class UndergroundNavigator {
                 } else if (inVehicle) {
                     vehicleSpeedModel(sample, dt)
                 } else {
-                    // Not known to be in a vehicle (building, escalator): keep the last real
-                    // speed and let it fade; never invent motion when there was none.
-                    speed *= kotlin.math.exp(-dt / FREE_SPEED_DECAY_TAU_SEC)
+                    // Not known to be in a vehicle (building, escalator): keep the last real speed
+                    // and let it fade; never invent motion. With steps seen, no step means stopped.
+                    speed = if (lastStepMs != 0L) 0.0 else speed * kotlin.math.exp(-dt / FREE_SPEED_DECAY_TAU_SEC)
                 }
             }
         }
@@ -801,15 +992,60 @@ class UndergroundNavigator {
         }
     }
 
+    private fun noteSteps(sample: MotionSample) {
+        stepGapMs = sample.elapsedMs - lastStepMs
+        lastStepMs = sample.elapsedMs
+        stepRun = if (stepGapMs <= STEP_PAUSE_MS) stepRun + sample.steps else sample.steps
+    }
+
+    /** On foot with GPS: this walker's stride, from the GPS speed between steps. */
+    private fun learnStride(sample: MotionSample) {
+        if (inVehicle || stepGapMs > STEP_PAUSE_MS || speed < STRIDE_LEARN_MIN_MPS) return
+        strideLearnMeters += speed * stepGapMs / 1000.0
+        strideLearnSteps += sample.steps
+        if (strideLearnSteps >= STRIDE_LEARN_STEPS) {
+            strideMeters = (strideLearnMeters / strideLearnSteps).coerceIn(MIN_STRIDE_METERS, MAX_STRIDE_METERS)
+        }
+    }
+
+    /** On foot without GPS, off a line: every step moves the estimate one stride along the heading. */
+    private fun followSteps(sample: MotionSample, dt: Double) {
+        stillAccepted = false
+        if (watchingDeparture) detectDeparture(sample, dt) // vibration can look like steps: a vehicle still shows its push
+        followTurnWithGyro(sample, dt, WALK_MAX_TURN_DPS)
+        if (sample.steps == 0) return
+        val walked = sample.steps * strideMeters
+        speed = (walked * 1000.0 / stepGapMs.coerceIn(STEP_MIN_GAP_MS, STEP_PAUSE_MS)).coerceAtMost(WALKING_MAX_MPS)
+        if (!onFoot) {
+            onFoot = true
+            events.add(String.format(Locale.US, "On foot: following steps of %.2f m", strideMeters))
+        }
+        if (!headingKnown) { // nothing says which way: the position goes stale instead
+            uncertainty += walked
+            return
+        }
+        val (nLat, nLon) = GeoToolbox.moveLocation(lat, lon, walked, heading)
+        lat = nLat; lon = nLon
+        distanceSinceLoss += walked
+        uncertainty += walked * STEP_ERROR_FRACTION
+        source = PositionSource.DEAD_RECKONING
+    }
+
     /**
      * After a stop: has the vehicle really pulled away? Yes when the acceleration of the last few
      * seconds adds up to a real speed in one direction. Off a line also when it turns (a standing
      * vehicle does not; a train always shows its push). On a line also after moving vibration for
-     * [UNCONFIRMED_MOVING_ACCEPT_SEC] without a push (a stop that was misread); on a road that
-     * would run away at every long red light. Sets the speed.
+     * [UNCONFIRMED_MOVING_ACCEPT_SEC] without a push (a stop that was misread). On a road, after
+     * [VIBRATION_RESTART_SEC] of shaking at the level of this ride's driving: a pull-away too
+     * gentle to measure, which an idling engine (far quieter) or a short knock is not. Sets the speed.
      */
-    private fun confirmDeparture(dt: Double, turning: Boolean, onLine: Boolean): Boolean {
+    private fun confirmDeparture(dt: Double, turning: Boolean, onLine: Boolean, vibration: Double): Boolean {
         unconfirmedMovingSec += dt
+        val drivingLevel = if (movingVibrationSec >= MOVING_VIBRATION_MIN_SEC) VIBRATION_RESTART_FRACTION * movingVibration
+            else max(VIBRATION_RESTART_MIN, VIBRATION_RESTART_STANDING_RATIO * standingVibration)
+        if (!vibration.isNaN() && !drivingLevel.isNaN()) {
+            drivingVibrationSec = if (vibration >= drivingLevel) drivingVibrationSec + dt else max(0.0, drivingVibrationSec - dt)
+        }
         val dv = recentDv(DEPARTURE_CONFIRM_WINDOW_MS)
         when {
             dv >= DEPARTURE_CONFIRM_DV_MPS && recentConsistency(DEPARTURE_CONFIRM_WINDOW_MS) >= DEPARTURE_MIN_CONSISTENCY &&
@@ -824,9 +1060,19 @@ class UndergroundNavigator {
                 speed = cruiseSpeed * 0.5
                 events.add("Movement resumed without a clear departure (stop was probably misdetected)")
             }
+            onLine && stoppedByPressure && pressureMovingSec >= PRESSURE_DEPARTED_SEC -> {
+                speed = cruiseSpeed * 0.5
+                velKnown = false // no push was measured: the integrated speed says nothing here
+                events.add("Departure seen from the pressure")
+            }
+            !onLine && drivingVibrationSec >= VIBRATION_RESTART_SEC -> {
+                speed = max(dv, cruiseSpeed * 0.5)
+                events.add("Movement resumed: vibration back at driving level")
+            }
             else -> return false
         }
         motionConfirmed = true
+        stoppedByPressure = false
         inVehicle = true
         return true
     }
@@ -866,7 +1112,9 @@ class UndergroundNavigator {
      * vehicle is never standing, whatever the vibration says.
      */
     private fun motionStateOf(s: MotionSample, turning: Boolean, dt: Double): MotionSample {
+        stillFromPressure = false
         stillFromVibrationDrop = false
+        phoneStill = s.state == MotionState.STATIONARY && !turning
         if (turning && s.state == MotionState.STATIONARY) {
             quietSinceMs = 0L
             return s.copy(state = MotionState.MOVING, stationaryForMs = 0L)
@@ -877,7 +1125,7 @@ class UndergroundNavigator {
             movingVibration = if (movingVibration.isNaN()) v else movingVibration + (v - movingVibration) * min(1.0, dt / MOVING_VIBRATION_TAU_SEC)
             movingVibrationSec += dt
         }
-        if (gpsAvailable || turning || !s.orientationKnown || s.state != MotionState.MOVING || v.isNaN() ||
+        if (turning || s.state != MotionState.MOVING || v.isNaN() ||
             movingVibrationSec < MOVING_VIBRATION_MIN_SEC || v >= VIBRATION_DROP_FRACTION * movingVibration) {
             quietSinceMs = 0L
             return s
@@ -885,8 +1133,43 @@ class UndergroundNavigator {
         if (quietSinceMs == 0L) quietSinceMs = s.elapsedMs
         val quietFor = s.elapsedMs - quietSinceMs
         if (quietFor < QUIET_CONFIRM_MS) return s
+        phoneStill = true
+        if (gpsAvailable || !s.orientationKnown) return s // the stop itself needs no sensors with GPS
         stillFromVibrationDrop = true
         return s.copy(state = MotionState.STATIONARY, stationaryForMs = quietFor)
+    }
+
+    /**
+     * On a line without GPS, near a station: pressure steady for [PRESSURE_STEADY_MS] means the
+     * train stands. A moving train keeps pushing the tunnel air around. On the real ride this
+     * showed every stop, while a phone held in the hand never looked still. Open-air running can
+     * be steady too, so it counts only near a station.
+     */
+    private fun stateWithPressure(s: MotionSample): MotionSample {
+        if (s.heightMeters.isNaN()) return s
+        heightHistory.addLast(doubleArrayOf(s.elapsedMs.toDouble(), s.heightMeters))
+        while (s.elapsedMs - heightHistory.first()[0] > PRESSURE_STEADY_MS) heightHistory.removeFirst()
+        val spanMs = s.elapsedMs - heightHistory.first()[0]
+        val steady = spanMs >= PRESSURE_STEADY_MS * 0.9 &&
+            heightHistory.maxOf { it[1] } - heightHistory.minOf { it[1] } <= PRESSURE_STEADY_RANGE_METERS
+        if (steady && !pressureSteady) pressureSteadySinceMs = heightHistory.first()[0].toLong()
+        pressureSteady = steady
+        val recent = heightHistory.filter { s.elapsedMs - it[0] <= PRESSURE_MOVING_WINDOW_MS }
+        val changing = recent.maxOf { it[1] } - recent.minOf { it[1] } > PRESSURE_MOVING_RANGE_METERS
+        pressureMovingSec = if (changing) pressureMovingSec + s.dtSec else 0.0
+        val r = route?.takeIf { onTrack }
+        if (gpsAvailable || r == null || s.state == MotionState.WALKING) { stoppedByPressure = false; return s }
+        val staying = stoppedByPressure && pressureMovingSec < PRESSURE_DEPARTED_SEC
+        if (!steady && !staying) return s
+        if (!staying) {
+            // Just left a station: air settling behind the train is not another stop there.
+            val nearest = listOfNotNull(r.nextStation(navDist, direction, tolerance = 0.0), r.nextStation(navDist, -direction, tolerance = 0.0))
+                .filter { it.name != lastStopStation?.name || movingSecondsSinceStop >= PRESSURE_LEFT_STATION_SEC }
+                .minOfOrNull { abs(it.distanceAlongTrack - navDist) } ?: return s
+            if (nearest > max(PRESSURE_STOP_RADIUS_METERS, min(PRESSURE_STOP_SIGMAS * uncertainty, PRESSURE_STOP_MAX_RADIUS_METERS))) return s
+        }
+        stillFromPressure = true
+        return s.copy(state = MotionState.STATIONARY, stationaryForMs = max(s.stationaryForMs, s.elapsedMs - pressureSteadySinceMs))
     }
 
     /**
@@ -990,11 +1273,14 @@ class UndergroundNavigator {
             pendingOvershoot += step
             // A train that will stop here is braking by now; one still at speed is running through
             // (express): move on instead of creeping past the station for half a run.
-            val passing = accelMeasured && directionKnown && nowMs - holdStartMs >= HOLD_PASS_CHECK_MS &&
+            // With a barometer the stop can still be confirmed after the train has come to rest.
+            val passCheckMs = if (heightHistory.isEmpty()) HOLD_PASS_CHECK_MS else HOLD_PASS_CHECK_BARO_MS
+            val passing = accelMeasured && directionKnown && nowMs - holdStartMs >= passCheckMs &&
                 speed >= HOLD_PASS_MIN_SPEED_MPS && speed >= HOLD_PASS_SPEED_FRACTION * holdStartSpeed
-            if (pendingOvershoot <= holdAllowance && !passing) {
+            val waitingForPressure = heightHistory.isNotEmpty() && nowMs - holdStartMs < passCheckMs
+            if ((pendingOvershoot <= holdAllowance || waitingForPressure) && !passing) {
                 holdCreep += step * HOLD_CREEP_FRACTION
-                navDist = (held.distanceAlongTrack + direction * (holdCreep - HOLD_MARGIN_METERS)).coerceIn(0.0, r.length)
+                navDist = (held.distanceAlongTrack + direction * (holdCreep - holdMargin)).coerceIn(0.0, r.length)
                 applyTrackPosition(r)
                 return
             }
@@ -1023,7 +1309,9 @@ class UndergroundNavigator {
                 pendingOvershoot = beyond
                 holdStartMs = nowMs
                 holdStartSpeed = speed
-                newDist = next.distanceAlongTrack - direction * HOLD_MARGIN_METERS
+                // At the end of the line there may be no track left to creep along: start earlier.
+                holdMargin = if (r.nextStation(next.distanceAlongTrack, direction, tolerance = 0.0) == null) LINE_END_HOLD_MARGIN_METERS else HOLD_MARGIN_METERS
+                newDist = next.distanceAlongTrack - direction * holdMargin
             }
         }
         navDist = newDist.coerceIn(0.0, r.length)
@@ -1042,9 +1330,13 @@ class UndergroundNavigator {
         val segStartStation = next?.let { r.nextStation(it.distanceAlongTrack, -direction, tolerance = 0.0) }
         val segLen = if (next != null && segStartStation != null) abs(next.distanceAlongTrack - segStartStation.distanceAlongTrack) else 1000.0
         val aheadWindow = max(STOP_SNAP_AHEAD_MIN_METERS, segLen * STOP_SNAP_AHEAD_FRACTION) + pendingOvershoot
+        // Well ahead of the train (after a restart, say) the estimate must still come back to the
+        // station, or the error would last for the rest of the ride; but never to the one it left.
+        val behindWindow = if (prev?.name == lastStopStation?.name) STOP_SNAP_BEHIND_METERS
+            else max(STOP_SNAP_BEHIND_METERS, min(HOLD_SIGMAS * uncertainty, segLen * OVERSHOOT_FRACTION))
         val candidates = listOfNotNull(
             next?.takeIf { abs(it.distanceAlongTrack - navDist) <= aheadWindow },
-            prev?.takeIf { abs(it.distanceAlongTrack - navDist) <= STOP_SNAP_BEHIND_METERS }
+            prev?.takeIf { abs(it.distanceAlongTrack - navDist) <= behindWindow }
         )
         // Odometer: the drift-corrected inertial distance since the last trusted station says
         // which station (if any) lies that far along. Better than the running estimate, which
@@ -1084,6 +1376,15 @@ class UndergroundNavigator {
         applyTrackPosition(r)
         events.add("Stopped at ${station.name}")
         if (destination?.name == station.name) events.add("Arrived at destination ${station.name}")
+        // The end of the line: the train can only go back, whatever the compass will say.
+        directionCertain = false
+        if (directionKnown && r.nextStation(station.distanceAlongTrack, direction, tolerance = 0.0) == null) {
+            destination = null
+            setDirection(-direction)
+            directionCertain = true
+            applyTrackPosition(r)
+            events.add("End of the line: next run back towards ${r.nextStation(navDist, direction, tolerance = 0.0)?.name ?: "end of line"}")
+        }
     }
 
     /**
@@ -1160,19 +1461,24 @@ class UndergroundNavigator {
         if (strong && destination == null) { // a chosen destination wins
             val diffForward = GeoToolbox.bearingDifference(bearing, r.bearingAt(navDist, 1))
             val newDir = if (diffForward <= 90.0) 1 else -1
-            // A known direction only flips on a clearly opposite departure (e.g. the train
-            // reversing at a terminus), not on one that is merely rotated by compass error.
-            val clearlyOpposite = min(diffForward, 180.0 - diffForward) <= 90.0 - DIRECTION_FLIP_MARGIN_DEG
-            if (!directionKnown || (newDir != direction && clearlyOpposite)) {
-                if (newDir != direction) clearHold()
-                direction = newDir
-                directionKnown = true
+            val clearlyOpposite = min(diffForward, 180.0 - diffForward) <= 90.0 - DIRECTION_DOUBT_MARGIN_DEG
+            if (!directionKnown) {
+                setDirection(newDir, confirmed = false)
                 events.add("Departure detected, heading towards ${r.nextStation(navDist, direction)?.name ?: "end of line"}")
+            } else if (newDir != direction && clearlyOpposite && !directionCertain && !directionUnconfirmed) {
+                // The compass alone never turns a known direction round (steel and motors can throw
+                // it right off), but the train may really have reversed here: let curves and
+                // network fixes decide, counting from this station.
+                directionUnconfirmed = true
+                directionSetAt = navDist
+                oppositeFixes = 0
             }
-            if (directionKnown && newDir == direction) {
+            // With the direction certain, this push shows the compass error, however large.
+            if (directionCertain || (directionKnown && newDir == direction)) {
                 learnCompassOffset(measured, r.bearingAt(navDist, direction), COMPASS_LEARN_RATE_DEPARTURE)
             }
         }
+        if (strong) directionCertain = false
         flushUndirected(r)
     }
 
@@ -1197,10 +1503,10 @@ class UndergroundNavigator {
      * Without a line, the vehicle's turns come from the gyroscope: the phone turns with the vehicle,
      * so its turn rate about the vertical is the vehicle's (curves, junctions, roundabouts).
      */
-    private fun followTurnWithGyro(sample: MotionSample, dt: Double) {
+    private fun followTurnWithGyro(sample: MotionSample, dt: Double, maxTurnDps: Double = VEHICLE_MAX_TURN_DPS) {
         if (sample.yawRateDps.isNaN() || !headingKnown) return
         val rate = sample.yawRateDps - yawBiasDps
-        if (abs(rate) > VEHICLE_MAX_TURN_DPS) return // the phone is being turned in the hand, not the vehicle
+        if (abs(rate) > maxTurnDps) return // the phone is being turned in the hand, not the vehicle
         heading = ((heading + rate * dt) % 360.0 + 360.0) % 360.0
     }
 
@@ -1320,7 +1626,8 @@ class UndergroundNavigator {
             return
         }
         if (!curveRefValid) return
-        if (abs(yaw) > HANDLING_YAW_DPS || sample.state == MotionState.WALKING) {
+        handlingSec = if (abs(yaw) > HANDLING_YAW_DPS) handlingSec + dt else 0.0
+        if (handlingSec >= HANDLING_MIN_SEC || sample.state == MotionState.WALKING) {
             curveRefValid = false // the phone was turned in the hand: the reference is lost until the next station
             return
         }
@@ -1328,7 +1635,9 @@ class UndergroundNavigator {
         curveRefSec += dt
         yawSmoothed += (yaw - yawSmoothed) * min(1.0, dt / CURVE_YAW_SMOOTHING_SEC)
         yawSettledSec = if (abs(yawSmoothed) < CURVE_SETTLED_YAW_DPS) yawSettledSec + dt else 0.0
-        if (!directionKnown || yawSettledSec < CURVE_SETTLE_SEC || abs(yawSinceRef - lastAppliedYaw) < CURVE_MIN_TURN_DEG) return
+        // An unconfirmed direction is also checked when the line curves here but the train did not.
+        val missedCurve = directionUnconfirmed && abs(r.turnBetween(curveRefDist, navDist) - yawSinceRef) >= CURVE_MIN_TURN_DEG
+        if (!directionKnown || yawSettledSec < CURVE_SETTLE_SEC || (abs(yawSinceRef - lastAppliedYaw) < CURVE_MIN_TURN_DEG && !missedCurve)) return
         lastAppliedYaw = yawSinceRef
         val measured = yawSinceRef
         val ref = curveRefDist
@@ -1337,7 +1646,10 @@ class UndergroundNavigator {
         // curve"), so an estimate that already agrees is left alone; one that contradicts the
         // measured turn moves to the nearest position that agrees with it.
         fun agrees(d: Double) = abs(r.turnBetween(ref, d) - measured) <= CURVE_AGREE_SIGMAS * sigma
-        if (agrees(navDist)) return
+        if (agrees(navDist)) {
+            if (abs(measured) >= CURVE_MIN_TURN_DEG) directionUnconfirmed = false // a real curve, where the line has one
+            return
+        }
         val window = WEAK_GATE_SIGMAS * max(uncertainty, MIN_TRACK_UNCERTAINTY_METERS)
         var best: Double? = null
         var d = navDist - window
@@ -1346,6 +1658,10 @@ class UndergroundNavigator {
             val ahead = direction * (c - ref) >= 0
             if (ahead && agrees(c) && (best == null || abs(c - navDist) < abs(best - navDist))) best = c
             d += CURVE_SEARCH_STEP_METERS
+        }
+        if (best == null && directionUnconfirmed && curvesFitOppositeDirection(r, measured, CURVE_AGREE_SIGMAS * sigma, window)) {
+            correctDirection(r, "the line's curves")
+            return
         }
         val target = best ?: return
         // Trains do not reverse: a backward move only if well outside our uncertainty.
@@ -1358,6 +1674,18 @@ class UndergroundNavigator {
         if (jump >= CORRECTION_REPORT_METERS) events.add(String.format(Locale.US, "Curve matching moved the position %.0f m along %s", jump, r.lineName))
     }
 
+    /** Would the [measured] turn fit if the train had gone the other way from where the direction was set? */
+    private fun curvesFitOppositeDirection(r: MetroRoute, measured: Double, tolerance: Double, window: Double): Boolean {
+        val from = 2 * directionSetAt - curveRefDist
+        val at = 2 * directionSetAt - navDist
+        var d = at - window
+        while (d <= at + window) {
+            if (abs(r.turnBetween(from, d.coerceIn(0.0, r.length)) - measured) <= tolerance) return true
+            d += CURVE_SEARCH_STEP_METERS
+        }
+        return false
+    }
+
     private fun startDepartureWatch() {
         watchingDeparture = true
         departureAccumE = 0.0; departureAccumN = 0.0; departureTime = 0.0; departureAbs = 0.0
@@ -1365,8 +1693,28 @@ class UndergroundNavigator {
 
     private fun inferDirectionFromBearing(bearing: Double) {
         val r = route ?: return
-        direction = if (GeoToolbox.bearingDifference(bearing, r.bearingAt(navDist, 1)) <= 90.0) 1 else -1
+        setDirection(if (GeoToolbox.bearingDifference(bearing, r.bearingAt(navDist, 1)) <= 90.0) 1 else -1)
+    }
+
+    /** [confirmed] false: it rests on the compass alone, which steel and motors can throw right off. */
+    private fun setDirection(newDirection: Int, confirmed: Boolean = true) {
+        direction = newDirection
         directionKnown = true
+        directionUnconfirmed = !confirmed
+        directionSetAt = navDist
+        oppositeFixes = 0
+    }
+
+    /** The compass gave the wrong direction: the train really went the other way from where it was set. */
+    private fun correctDirection(r: MetroRoute, evidence: String) {
+        navDist = (2 * directionSetAt - navDist).coerceIn(0.0, r.length)
+        clearHold()
+        setDirection(-direction)
+        compassOffX = 0.0; compassOffY = 0.0 // learnt from departures in the wrong direction
+        resetSegment()
+        lastStopStation = null
+        applyTrackPosition(r)
+        events.add("Direction corrected from $evidence: heading towards ${r.nextStation(navDist, direction)?.name ?: "end of line"}")
     }
 
     private fun applyTrackPosition(r: MetroRoute) {
@@ -1389,7 +1737,6 @@ class UndergroundNavigator {
     fun state(): NavState {
         val r = route
         val lostFor = if (gpsAvailable || gpsLostAtMs == 0L) 0L else nowMs - gpsLostAtMs
-        val underground = !gpsAvailable && hasPosition && (lostFor >= UNDERGROUND_AFTER_MS || pressureRapid)
         val trackActive = r != null && onTrack
 
         val next = if (trackActive) r!!.nextStation(navDist, direction) else null
@@ -1425,13 +1772,15 @@ class UndergroundNavigator {
             trackActive && atStation && motion != MotionState.MOVING -> "No GPS · at ${prev!!.name}"
             trackActive -> "No GPS · track navigation" + if (directionKnown) "" else " (direction unknown)"
             source == PositionSource.NETWORK -> "No GPS · network location"
+            source == PositionSource.ESTIMATE -> "No GPS · phone estimate"
             else -> "No GPS · dead reckoning"
         } + (if (!gpsAvailable && hasPosition && networkCorrections > 0) " · network-assisted" else "") +
             (if (!gpsAvailable && hasPosition && curveCorrections > 0) " · curve-matched" else "")
 
         return NavState(
-            latitude = lat, longitude = lon, source = source, gpsAvailable = gpsAvailable, underground = underground,
-            speedMps = speed, headingDeg = heading, motion = motion, gpsLostForMs = lostFor,
+            latitude = lat, longitude = lon, source = source, gpsAvailable = gpsAvailable,
+            speedMps = speed, headingDeg = heading, headingKnown = headingKnown || (trackActive && directionKnown),
+            gpsAltitudeMeters = if (gpsAvailable) lastAltitude else null, motion = motion, gpsLostForMs = lostFor,
             distanceSinceGpsLossMeters = distanceSinceLoss, uncertaintyMeters = uncertainty,
             gpsAccuracyMeters = if (gpsAvailable) lastAccuracy else null,
             confidence = confidence, status = status,
@@ -1470,9 +1819,26 @@ class UndergroundNavigator {
         const val WEAK_OFF_TRACK_TOLERANCE_METERS = 150.0
         const val MAX_GAP_SEC = 15.0
         /** No good satellite fix for this long (only poor ones): GPS counts as lost (like SensorHub's watchdog). */
-        const val GOOD_GPS_TIMEOUT_MS = 6_000L
+        const val GOOD_GPS_TIMEOUT_MS = 3_000L
         /** A free estimate rejects this many network fixes that agree with each other, then moves to them. */
         const val WEAK_REJECT_RESET_COUNT = 3
+        /** Fixes this close are the same fix (about 0.2 m; the log keeps 6 decimals). */
+        const val SAME_FIX_DEGREES = 0.000002
+        /** What a mobile-cell fix is really worth, whatever it claims. */
+        const val COARSE_FIX_ACCURACY_METERS = 1_500f
+        /** Pressure steady this long, within this height: the train stands (near a station). */
+        const val PRESSURE_STEADY_MS = 10_000L
+        const val PRESSURE_STEADY_RANGE_METERS = 0.4
+        const val PRESSURE_STOP_RADIUS_METERS = 200.0
+        const val PRESSURE_STOP_MAX_RADIUS_METERS = 400.0
+        const val PRESSURE_STOP_SIGMAS = 2.0
+        /** Height moving by this much within the window, for this long: the train has left. */
+        const val PRESSURE_MOVING_WINDOW_MS = 5_000L
+        const val PRESSURE_MOVING_RANGE_METERS = 0.3
+        const val PRESSURE_DEPARTED_SEC = 8.0
+        const val PRESSURE_LEFT_STATION_SEC = 30.0
+        /** Below this a jump of the GPS position says nothing about the direction of travel. */
+        const val DIRECTION_FROM_MOTION_MIN_MPS = 1.0
 
         // Track locking / stations (m)
         const val LOCK_RADIUS_METERS = 60.0
@@ -1493,10 +1859,12 @@ class UndergroundNavigator {
         const val ODOMETER_TOLERANCE_FRACTION = 0.1
         private val NO_STATION = MetroStation("\u0000none", 0.0, 0.0)
         const val HOLD_MARGIN_METERS = 5.0
+        const val LINE_END_HOLD_MARGIN_METERS = 40.0
         /** Speed of the held estimate as a share of the model's: slow, but never frozen while moving. */
         const val HOLD_CREEP_FRACTION = 0.15
         /** Held at a station this long with no braking (speed kept): the train is running through. */
         const val HOLD_PASS_CHECK_MS = 6_000L
+        const val HOLD_PASS_CHECK_BARO_MS = 30_000L
         const val HOLD_PASS_MIN_SPEED_MPS = 8.0
         const val HOLD_PASS_SPEED_FRACTION = 0.85
         const val DESTINATION_MIN_DISTANCE_METERS = 30.0
@@ -1521,19 +1889,44 @@ class UndergroundNavigator {
         const val FREE_SPEED_ERROR_FRACTION = 0.3
         const val FREE_BASE_ERROR_MPS = 1.0
 
-        const val UNDERGROUND_AFTER_MS = 5_000L
         const val FREE_SPEED_DECAY_TAU_SEC = 60.0
 
         // Vehicle model without a line
         const val VEHICLE_MIN_MPS = 5.0
         const val WALKING_MAX_MPS = 2.5
         const val WALK_ENDS_RIDE_SEC = 20.0
+        const val DEFAULT_STRIDE_METERS = 0.7
+        const val MIN_STRIDE_METERS = 0.4
+        const val MAX_STRIDE_METERS = 1.0
+        const val STRIDE_LEARN_STEPS = 20
+        const val STRIDE_LEARN_MIN_MPS = 0.4
+        const val WALK_COURSE_MIN_MPS = 0.5
+        const val WALK_MAX_TURN_DPS = 360.0
+        const val STEP_MIN_GAP_MS = 250L
+        const val STEP_PAUSE_MS = 2_000L
+        const val STEP_ERROR_FRACTION = 0.15
+        /** This many steps in a row on a line, never having been in a vehicle: on foot beside it. */
+        const val STEPS_TO_LEAVE_LINE = 10
+        /** Walking-type shaking this long without steps: walking anyway, at this cadence. */
+        const val WALK_WITHOUT_STEPS_SEC = 3.0
+        const val WALK_CADENCE_HZ = 1.6
+        /** After a restart: the gap counts as this share of the distance the train could have run. */
+        const val RESUME_GAP_ERROR_FRACTION = 0.5
+        /** After a restart: the saved speed is carried on for this long at most (it may have stopped since). */
+        const val RESUME_MAX_CARRY_SEC = 30.0
         /** GPS lost at this speed or less: the vehicle stands, and must be seen pulling away. */
         const val STANDING_AT_LOSS_MPS = 1.0
 
         // Stop / departure verification
         const val DV_HISTORY_MS = 25_000L
         const val UNCONFIRMED_MOVING_ACCEPT_SEC = 20.0
+        /** Off a line: this long at this fraction of the ride's driving vibration restarts the estimate. */
+        const val VIBRATION_RESTART_SEC = 10.0
+        const val VIBRATION_RESTART_FRACTION = 0.7
+        /** Not driven long enough to know the driving level: this many times the vibration at the stop, and at least the minimum. */
+        const val VIBRATION_RESTART_STANDING_RATIO = 5.0
+        const val VIBRATION_RESTART_MIN = 0.2
+        const val STANDING_VIBRATION_TAU_SEC = 5.0
         /** Speed given to a departure seen only as a turn (pulling out of a junction). */
         const val TURN_DEPARTURE_SPEED_MPS = 3.0
         /** Below this speed a stop needs no braking proof. */
@@ -1552,8 +1945,8 @@ class UndergroundNavigator {
         const val DEPARTURE_MIN_CONSISTENCY = 0.7
         /** A departure keeps pushing; a knock that happens to push one way lasts about a second. */
         const val DEPARTURE_MIN_PUSH_MS = 2_000L
-        /** A known direction flips only if the departure is within 90 − this of the opposite way. */
-        const val DIRECTION_FLIP_MARGIN_DEG = 45.0
+        /** A departure within 90 − this of the opposite way casts doubt on a known direction. */
+        const val DIRECTION_DOUBT_MARGIN_DEG = 45.0
         const val COMPASS_CAL_MIN_ACCEL = 0.4
         const val COMPASS_LEARN_RATE_GPS = 0.02
         const val COMPASS_LEARN_RATE_DEPARTURE = 0.3
@@ -1589,6 +1982,7 @@ class UndergroundNavigator {
         // Curve matching
         /** Faster than any train curve: the phone is being turned in the hand. */
         const val HANDLING_YAW_DPS = 15.0
+        const val HANDLING_MIN_SEC = 0.3
         const val CURVE_SETTLED_YAW_DPS = 0.5
         const val CURVE_YAW_SMOOTHING_SEC = 2.0
         const val CURVE_SETTLE_SEC = 3.0
@@ -1625,6 +2019,14 @@ class UndergroundNavigator {
         const val MOVING_VIBRATION_MIN_SPEED_MPS = 4.0
         /** Vibration this far down for this long reads as standing (like the phone's own 1 s rule). */
         const val QUIET_CONFIRM_MS = 1_000L
+
+        // Standing with GPS: the coordinates stay
+        /** A standing receiver still reports about 0.1 m/s. */
+        const val GPS_STANDING_MPS = 0.5
+        /** Further from the held position than this (or twice the fix's accuracy) is not noise. */
+        const val GPS_NOISE_METERS = 15.0
+        /** A fix this much more accurate than the held position replaces it. */
+        const val GPS_BETTER_FIX_FRACTION = 0.5
 
         // Weak satellite fixes
         const val WEAK_GNSS_SPEED_MAX_ACCURACY_METERS = 100f

@@ -10,12 +10,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- The phone's step detector: following someone on foot without GPS. -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
     <!-- Lets "Fix" ask directly to keep navigating with the screen off (the user still approves). -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <!-- Lets the app be chosen as the mock location app, to send its position to Nemo Handy without GPS. -->
-    <uses-permission
-        android:name="android.permission.ACCESS_MOCK_LOCATION"
-        tools:ignore="MockLocation,ProtectedPermissions" />
 
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <uses-permission

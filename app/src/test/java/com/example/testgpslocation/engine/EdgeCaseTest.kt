@@ -381,6 +381,84 @@ class EdgeCaseTest {
     }
 
     @Test
+    fun goodNetworkFixesStayingAtAStationAreAStop() {
+        rideIntoTunnel()
+        run(MotionState.MOVING, 30.0)
+        val b = route.stations[1]
+        repeat(3) { k -> clock += 5000; cellFix(b.lat + k * 0.0001, 50f) }
+        assertTrue("events ${nav.events}", nav.events.any { it == "Stopped at B" })
+        assertEquals(0.0, nav.state().speedMps, 1e-9)
+    }
+
+    @Test
+    fun fixesThatMoveOnAreNotAStop() {
+        rideIntoTunnel()
+        run(MotionState.MOVING, 30.0)
+        val b = route.stations[1]
+        repeat(3) { k -> clock += 5000; cellFix(b.lat + k * 0.001, 50f) } // 110 m apart: a moving train
+        assertFalse("events ${nav.events}", nav.events.any { it == "Stopped at B" })
+    }
+
+    @Test
+    fun aStopWithGpsIsLoggedOnce() {
+        nav.setRoute(route)
+        gnss(12.9099); gnss(12.90999)
+        repeat(10) { gnss(12.91, speed = 0f); run(MotionState.STATIONARY, 0.9) }
+        assertEquals(nav.events.toString(), 1, nav.events.count { it == "Stopped at B (GPS)" })
+    }
+
+    @Test
+    fun aDepartureSeenFromThePressureWaitsForTheDirection() {
+        nav.setRoute(route)
+        nav.onLocationFix(GpsPoint(12.91, 77.0, 30f, clock, elapsedRealtimeMs = clock, isGnss = false), clock) // at B, no GPS, no direction
+        riding(15.0) { 2.0 }
+        val before = nav.currentLat
+        riding(12.0) { k -> 2.0 + k * 0.03 }
+        assertFalse(nav.state().directionKnown)
+        assertEquals("no jump either way", before, nav.currentLat, 1e-9)
+    }
+
+    @Test
+    fun aBarometerThatGoesQuietReleasesTheStop() {
+        standingAtStationBThenLeaving()
+        riding(15.0) { 2.0 }
+        riding(25.0) { Double.NaN } // no readings any more
+        riding(25.0) { Double.NaN }
+        assertTrue("events ${nav.events}", nav.events.any { it.startsWith("Movement resumed") })
+    }
+
+    @Test
+    fun theLogSaysHowTheSpeedIsWorkedOut() {
+        rideIntoTunnel()
+        run(MotionState.MOVING, 5.0)
+        val d = nav.diagnostics()
+        assertTrue(d, d.startsWith("ENGINE: line profile"))
+        assertTrue(d, d.contains("next stop B") && d.contains("limits: top") && d.contains("stop signals:"))
+    }
+
+    @Test
+    fun aTightCurveAheadSlowsTheRun() {
+        // North for 1.5 km, then a 90° bend of about 100 m radius, then east to station B.
+        val pts = (0..150).map { TrackPoint(12.90 + it * 0.0001, 77.0) } +
+            (1..15).map { k -> val a = Math.toRadians(k * 6.0); TrackPoint(12.915 + 0.0009 * kotlin.math.sin(a), 77.0 + 0.00092 * (1 - kotlin.math.cos(a))) } +
+            (1..100).map { TrackPoint(12.9159, 77.00092 + it * 0.0001) }
+        val curved = MetroRoute("curve", "Curve Line", "A", "B", pts, listOf(MetroStation("A", 12.90, 77.0), MetroStation("B", 12.9159, 77.01)))
+        val bend = curved.project(12.915 + 0.0009 * kotlin.math.sin(Math.toRadians(45.0)), 77.0 + 0.00092 * (1 - kotlin.math.cos(Math.toRadians(45.0)))).distanceAlongTrack
+        assertTrue("radius ${curved.radiusAt(bend)}", curved.radiusAt(bend) in 60.0..160.0)
+        assertEquals(Double.MAX_VALUE, curved.radiusAt(500.0), 0.0)
+        nav.setRoute(curved)
+        repeat(5) { k -> gnss(12.90 + k * 0.00018, speed = 20f) }
+        nav.onGpsLost(clock)
+        var slowest = Double.MAX_VALUE
+        repeat(1200) {
+            run(MotionState.MOVING, 0.1)
+            val along = curved.project(nav.currentLat, nav.currentLon).distanceAlongTrack
+            if (kotlin.math.abs(along - bend) < 20.0) slowest = minOf(slowest, nav.state().speedMps)
+        }
+        assertTrue("through the bend at $slowest m/s", slowest < kotlin.math.sqrt(1.5 * 160.0))
+    }
+
+    @Test
     fun aSteadyPressureNearAStationIsAStopEvenInTheHand() {
         standingAtStationBThenLeaving()
         riding(15.0) { 2.0 }
@@ -400,7 +478,7 @@ class EdgeCaseTest {
     fun aPressureThatKeepsChangingIsADeparture() {
         standingAtStationBThenLeaving()
         riding(15.0) { 2.0 }
-        riding(12.0) { k -> 2.0 + k * 0.03 }
+        riding(16.0) { k -> 2.0 + k * 0.03 }
         assertTrue("events ${nav.events}", nav.events.any { it == "Departure seen from the pressure" })
         assertTrue(nav.state().speedMps > 3.0)
     }

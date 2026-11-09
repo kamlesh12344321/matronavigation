@@ -58,7 +58,10 @@ data class RideState(
     val lastStation: String?,
     val savedAtMs: Long,
     val inVehicle: Boolean = true,
-    val headingKnown: Boolean = true
+    val headingKnown: Boolean = true,
+    val topSpeedMps: Double = UndergroundNavigator.DEFAULT_TOP_SPEED_MPS,
+    val rampSecPerMps: Double = UndergroundNavigator.DEFAULT_RAMP_SEC_PER_MPS,
+    val speedsLearnt: Boolean = false
 )
 
 enum class PositionSource(val label: String) {
@@ -178,6 +181,26 @@ class UndergroundNavigator {
     // Motion
     private var speed = 0.0
     private var cruiseSpeed = DEFAULT_CRUISE_MPS
+    // How this train runs, from this ride's GPS: top speed between stations, and the seconds spent
+    // speeding up plus braking for each m/s of it (1.0 = 1 m/s² each way). Used when no measured
+    // speed can be trusted (a phone in the hand): the run then follows the line's station spacing.
+    private var topSpeed = DEFAULT_TOP_SPEED_MPS
+    private var rampSecPerMps = DEFAULT_RAMP_SEC_PER_MPS
+    private var runLearnt = false
+    private var runStartMs = 0L
+    private var runPeak = 0.0
+    private var runMeters = 0.0
+    private var lastRunFixMs = 0L
+    private var prevRunFixSpeed = -1.0
+    private var runStartAlong = Double.NaN
+    private var runFromRest = false
+    private var assumedDwellSec = 0.0
+    /** Waiting at this station on the profile: no stop seen, a normal one is assumed. */
+    private var waitingAt: MetroStation? = null
+    /** The speed comes from a measured departure (a push the accelerometer saw), so it can be trusted. */
+    private var speedMeasured = false
+    /** The last stop was seen (sensors, pressure, network), not assumed. */
+    private var lastStopSeen = false
     /** How much real evidence the cruise speed rests on (GPS speed fixes, timed station runs). */
     private var cruiseEvidence = 0
     private val cruiseLearnt: Boolean get() = cruiseEvidence >= CRUISE_EVIDENCE_NEEDED
@@ -314,6 +337,17 @@ class UndergroundNavigator {
     /** How long the pressure has kept changing: a single step (doors) passes, a departure goes on. */
     private var pressureMovingSec = 0.0
 
+    // Good network fixes staying in one place: the train stands there
+    private var stayLat = Double.NaN
+    private var stayLon = Double.NaN
+    private var stayLastMs = 0L
+    private var stayFixes = 0
+    private var stoppedByStay = false
+
+    private var gpsStandingSinceMs = 0L
+    private var gpsStopNoted = false
+    private var gpsLeftStopMs = 0L
+
     private var lastWeakLat = Double.NaN
     private var lastWeakLon = Double.NaN
     /** Vibration at this ride's stops: the reference when it has not driven long enough to know its driving level. */
@@ -385,6 +419,7 @@ class UndergroundNavigator {
         onTrack = false
         lastTrackProjection = null
         lastStopStation = null
+        waitingAt = null
         resetSegment()
         val r = newRoute ?: return
         if (hasPosition) {
@@ -430,7 +465,8 @@ class UndergroundNavigator {
     /** The ride to save for [resume]; null while GPS works (nothing to recover) or without a position. */
     fun rideState(wallClockMs: Long): RideState? = if (gpsAvailable || !hasPosition) null else RideState(
         route?.takeIf { onTrack }?.id, lat, lon, navDist, direction, directionKnown, directionUnconfirmed,
-        heading, speed, cruiseSpeed, uncertainty, lastStopStation?.name, wallClockMs, inVehicle, headingKnown
+        heading, speed, cruiseSpeed, uncertainty, lastStopStation?.name, wallClockMs, inVehicle, headingKnown,
+        topSpeed, rampSecPerMps, runLearnt
     )
 
     /**
@@ -449,6 +485,8 @@ class UndergroundNavigator {
         speed = s.speedMps
         cruiseSpeed = s.cruiseSpeedMps; cruiseEvidence = CRUISE_EVIDENCE_NEEDED
         inVehicle = s.inVehicle
+        topSpeed = s.topSpeedMps; rampSecPerMps = s.rampSecPerMps; runLearnt = s.speedsLearnt
+        waitingAt = null
         motionConfirmed = speed >= STANDING_AT_LOSS_MPS // standing: only a real pull-away moves it
         resumeHistoryMissingSec = DV_HISTORY_MS / 1000.0
         uncertainty = s.uncertaintyMeters + gapSec * max(speed, cruiseSpeed) * RESUME_GAP_ERROR_FRACTION
@@ -529,6 +567,8 @@ class UndergroundNavigator {
 
         gpsAvailable = true
         onFoot = false
+        waitingAt = null
+        speedMeasured = false
         snappedAtStation = false
         resetSegment()
         lastGnssMs = nowMs
@@ -554,6 +594,7 @@ class UndergroundNavigator {
             cruiseSpeed = (cruiseSpeed * 0.9 + fixSpeed * 0.1).coerceIn(MIN_CRUISE_MPS, MAX_CRUISE_MPS)
             cruiseEvidence++
         }
+        learnRun(fixSpeed, fix.hasSpeed)
 
         // Every accepted fix is the position, unless the vehicle really stands: then GPS noise
         // (a few metres) must not move it. That takes both the phone reading still and GPS
@@ -592,6 +633,40 @@ class UndergroundNavigator {
             else if (prevProj != null && abs(navDist - prevProj) > 20.0 && fixSpeed > DIRECTION_FROM_MOTION_MIN_MPS) setDirection(if (navDist > prevProj) 1 else -1)
         }
         if (prevProj == null || abs(navDist - prevProj) > 20.0) lastTrackProjection = navDist
+    }
+
+    /**
+     * A run between two stops seen by GPS: its length, time and top speed tell how this train runs.
+     * Time over and above the run at top speed is the speeding up and braking. On the real ride the
+     * cruise speed learnt from fast moments alone was 18 m/s, the real moving average 12.5 m/s.
+     */
+    private fun learnRun(fixSpeed: Double, hasSpeed: Boolean) {
+        val dt = if (lastRunFixMs == 0L) 0.0 else ((nowMs - lastRunFixMs) / 1000.0).coerceAtLeast(0.0)
+        lastRunFixMs = nowMs
+        // A short gap (covered station) leaves the run as it was; a long one hides part of it.
+        if (dt > RUN_MAX_GAP_SEC) { runFromRest = false; prevRunFixSpeed = -1.0 }
+        if (!hasSpeed) { prevRunFixSpeed = -1.0; return }
+        val prev = prevRunFixSpeed
+        prevRunFixSpeed = fixSpeed
+        if (fixSpeed >= RUN_MIN_MPS) {
+            // Only a run GPS saw from rest: one joined half-way (GPS back on a ramp) looks far too quick.
+            if (runStartMs == 0L) { runStartMs = nowMs; runPeak = 0.0; runMeters = 0.0; runFromRest = prev in 0.0..RUN_MIN_MPS; runStartAlong = if (onTrack) navDist else Double.NaN } else runMeters += fixSpeed * dt.coerceAtMost(RUN_MAX_GAP_SEC)
+            runPeak = max(runPeak, fixSpeed)
+            return
+        }
+        if (fixSpeed > GPS_STANDING_MPS || runStartMs == 0L) return
+        val sec = (nowMs - runStartMs) / 1000.0
+        runStartMs = 0L
+        if (!runFromRest || runPeak < MIN_TOP_SPEED_MPS || runMeters < MIN_RUN_METERS || sec <= runMeters / runPeak) return
+        val ramp = ((sec - runMeters / runPeak) / runPeak).coerceIn(MIN_RAMP_SEC_PER_MPS, MAX_RAMP_SEC_PER_MPS)
+        // A run held back by a curve shows the curve's speed, not the train's top speed.
+        val r = route?.takeIf { onTrack }
+        val curveLimited = r != null && !runStartAlong.isNaN() && r.curveSpeedBetween(runStartAlong, navDist, CURVE_LATERAL_ACCEL) < runPeak + CURVE_LIMIT_MARGIN_MPS
+        if (!curveLimited) topSpeed = if (runLearnt) (topSpeed + runPeak) / 2 else runPeak
+        rampSecPerMps = if (runLearnt) (rampSecPerMps + ramp) / 2 else ramp
+        runLearnt = runLearnt || !curveLimited
+        events.add(String.format(Locale.US, "Learnt a GPS run: %.0f m in %.0f s, top %.1f m/s%s; now top speed %.1f m/s, speeding up and braking %.2f s per m/s",
+            runMeters, sec, runPeak, if (curveLimited) " (held back by a curve)" else "", topSpeed, rampSecPerMps))
     }
 
     /** Hold the coordinates? Not if the fix is clearly better, or too far away to be noise. */
@@ -658,6 +733,7 @@ class UndergroundNavigator {
                 // Standing at a known platform is better than any network fix; standing anywhere,
                 // the coordinates stay the same until the train moves (the fix is used then).
                 if (p.offsetMeters > accuracy + WEAK_OFF_TRACK_TOLERANCE_METERS) return "ignored: off the line"
+                if (heightHistory.isEmpty() && !coarse && fix.accuracy <= STAY_MAX_ACCURACY_METERS && stayingAtStation(rt, fix, p.distanceAlongTrack)) return "used: standing at a station"
                 val innovation = p.distanceAlongTrack - navDist
                 val stopped = snappedAtStation || standing
                 val far = abs(innovation) > WEAK_GATE_SIGMAS * sqrt(uncertainty * uncertainty + r * r)
@@ -722,6 +798,30 @@ class UndergroundNavigator {
         return "used"
     }
 
+    /**
+     * Good network fixes staying in one place near a station: the train stands there. Station Wi-Fi
+     * showed this on the real ride. For phones without a barometer, which sees it sooner and also
+     * sees the departure: an old fix can keep arriving after the train has left.
+     */
+    private fun stayingAtStation(r: MetroRoute, fix: GpsPoint, along: Double): Boolean {
+        val staying = stayFixes > 0 && fix.elapsedRealtimeMs - stayLastMs <= STAY_MAX_GAP_MS &&
+            GeoToolbox.calculateDistance(stayLat, stayLon, fix.latitude, fix.longitude) <= STAY_RADIUS_METERS
+        if (staying) stayFixes++ else { stayFixes = 1; stayLat = fix.latitude; stayLon = fix.longitude }
+        stayLastMs = fix.elapsedRealtimeMs
+        if (stayFixes < STAY_FIXES) return false
+        val station = r.stations.minByOrNull { abs(it.distanceAlongTrack - along) } ?: return false
+        if (abs(station.distanceAlongTrack - along) > STAY_STATION_RADIUS_METERS) return false
+        speed = 0.0
+        motionConfirmed = false
+        unconfirmedMovingSec = 0.0
+        clearHold()
+        startDepartureWatch()
+        stoppedByStay = true
+        navDist = station.distanceAlongTrack
+        if (station.name != lastStopStation?.name) arriveAt(r, station, trusted = true, seenFromPressure = false) else applyTrackPosition(r)
+        return true
+    }
+
     /** Counts [fix] among the rejected ones; true once enough of them in a row agree with each other. */
     private fun agreesWithLastRejected(fix: GpsPoint): Boolean {
         val prev = lastRejectedWeak
@@ -738,9 +838,14 @@ class UndergroundNavigator {
         if (!gpsAvailable && gpsLostAtMs != 0L) return
         gpsAvailable = false
         gpsLostAtMs = elapsedMs
+        // Before any whole run a normal metro top speed is assumed (the run in progress may still be
+        // speeding up); after that, a faster run in progress counts like one more run.
+        if (!runLearnt) topSpeed = max(runPeak, DEFAULT_TOP_SPEED_MPS).coerceIn(MIN_TOP_SPEED_MPS, MAX_TOP_SPEED_MPS)
+        else if (runStartMs != 0L && runPeak > topSpeed) topSpeed = ((topSpeed + runPeak) / 2).coerceAtMost(MAX_TOP_SPEED_MPS)
         distanceSinceLoss = 0.0
         stopHandled = false
-        movingSecondsSinceStop = 0.0
+        // The run from a station left with GPS goes on: its time counts for that run's speed.
+        movingSecondsSinceStop = if (gpsLeftStopMs != 0L) (elapsedMs - gpsLeftStopMs) / 1000.0 else 0.0
         if (!hasPosition) return
         if (lastGnssMs == 0L && route == null) return // never had a satellite fix (cold start / indoors): nothing to carry forward
         if (speed < STANDING_AT_LOSS_MPS && accelMeasured) {
@@ -783,6 +888,8 @@ class UndergroundNavigator {
             }
             uncertainty = max(uncertainty, MIN_TRACK_UNCERTAINTY_METERS) + gapSec * (speedErrorFraction * speed + TRACK_BASE_ERROR_MPS)
             events.add("GPS lost — tracking along ${r.lineName}")
+            events.add(String.format(Locale.US, "Running model: top speed %.1f m/s, speeding up and braking %.2f s per m/s (%s)",
+                topSpeed, rampSecPerMps, if (runLearnt) "learnt from GPS runs" else "default, no whole GPS run yet"))
         } else {
             if (speed > 1.0 && gapSec > 0 && headingKnown) {
                 val (nLat, nLon) = GeoToolbox.moveLocation(lat, lon, speed * gapSec, heading)
@@ -828,6 +935,7 @@ class UndergroundNavigator {
             // A long walk at walking pace ends the ride; a vehicle that merely stops is still one.
             if (walkingSeconds >= WALK_ENDS_RIDE_SEC && speed < WALKING_MAX_MPS) inVehicle = false
             if (sample.steps > 0) learnStride(sample)
+            noteGpsStop(sample)
             return
         }
         if (!hasPosition) return
@@ -872,7 +980,10 @@ class UndergroundNavigator {
                 // proof (sensor trouble); a vibration drop never is: a quiet stretch of smooth running
                 // looks the same.
                 val longStill = !stillFromVibrationDrop && sample.stationaryForMs >= LONG_STILL_ACCEPT_MS
-                if (braked || longStill || stillFromPressure) {
+                // With a barometer on a line, a pressure that keeps changing says the train is still
+                // running (a phone held still in the hand is not a standing train).
+                val pressureSaysMoving = route?.takeIf { onTrack } != null && heightHistory.isNotEmpty() && pressureMovingSec >= PRESSURE_VETO_SEC
+                if (stillFromPressure || ((braked || longStill) && !pressureSaysMoving)) {
                     stillAccepted = true
                     speedAtStill = 0.0
                     dvHistory.clear()
@@ -947,16 +1058,36 @@ class UndergroundNavigator {
                     // at this ride's driving level does, or it would run away at every long red light.
                     if (!confirmDeparture(dt, turning, onLine = r != null, sample.vibration)) speed = 0.0
                 } else if (r != null) {
-                    // On a metro line: IMU acceleration along the track + pull toward the cruise
-                    // speed of this ride, fused with the inertial speed.
-                    val along = if (directionKnown) {
-                        val b = Math.toRadians(r.bearingAt(navDist, direction) + compassOffsetDeg)
-                        sample.accelEast * sin(b) + sample.accelNorth * cos(b)
-                    } else 0.0
-                    speed += along.coerceIn(-MAX_ACCEL_MPS2, MAX_ACCEL_MPS2) * dt
-                    val tau = if (directionKnown) CRUISE_PULL_TAU_SEC else CRUISE_PULL_TAU_UNCERTAIN_SEC
-                    speed += (cruiseSpeed - speed) * (dt / tau)
-                    fuseIntegratedVelocity(dt)
+                    if (speedMeasured || !directionKnown) {
+                        // On a metro line, the speed measured since a measured departure: IMU
+                        // acceleration along the track + pull toward the cruise speed of this ride,
+                        // fused with the inertial speed.
+                        val along = if (directionKnown) {
+                            val b = Math.toRadians(r.bearingAt(navDist, direction) + compassOffsetDeg)
+                            sample.accelEast * sin(b) + sample.accelNorth * cos(b)
+                        } else 0.0
+                        speed += along.coerceIn(-MAX_ACCEL_MPS2, MAX_ACCEL_MPS2) * dt
+                        val tau = if (directionKnown) CRUISE_PULL_TAU_SEC else CRUISE_PULL_TAU_UNCERTAIN_SEC
+                        speed += (cruiseSpeed - speed) * (dt / tau)
+                        fuseIntegratedVelocity(dt)
+                    } else {
+                        // Nothing measured to trust (just lost GPS, a phone in the hand, a departure
+                        // seen only from pressure or network): a normal run between these stations
+                        // at this ride's speeds: speeding up, top speed, braking to the next stop.
+                        val waiting = waitingAt
+                        if (waiting != null) {
+                            speed = 0.0
+                            waitAtStation(r, waiting, dt)
+                        } else {
+                            val rate = 1.0 / rampSecPerMps
+                            speed += (profileSpeed(r) - speed).coerceIn(-PROFILE_BRAKE_SLACK * rate * dt, rate * dt)
+                            val end = sectionEnd(r)
+                            if (end != null && speed <= ASSUMED_STOP_MAX_MPS && abs(end.distanceAlongTrack - navDist) <= ASSUMED_STOP_RADIUS_METERS) {
+                                waitingAt = end
+                                assumedDwellSec = 0.0
+                            }
+                        }
+                    }
                 } else if (inVehicle) {
                     vehicleSpeedModel(sample, dt)
                 } else {
@@ -990,6 +1121,26 @@ class UndergroundNavigator {
             lat = nLat; lon = nLon
             source = PositionSource.DEAD_RECKONING
         }
+    }
+
+    /** With GPS a stop needs no sensors: this is for the log, and the station the next run starts from. */
+    private fun noteGpsStop(sample: MotionSample) {
+        if (speed >= GPS_STANDING_MPS) {
+            if (gpsStopNoted) gpsLeftStopMs = sample.elapsedMs
+            gpsStandingSinceMs = 0L; gpsStopNoted = false
+            return
+        }
+        if (gpsStandingSinceMs == 0L) gpsStandingSinceMs = sample.elapsedMs
+        if (gpsStopNoted || sample.elapsedMs - gpsStandingSinceMs < STATION_STOP_MS) return
+        gpsStopNoted = true
+        val r = route?.takeIf { onTrack } ?: return
+        val station = r.stations.minByOrNull { abs(it.distanceAlongTrack - navDist) } ?: return
+        if (abs(station.distanceAlongTrack - navDist) > GPS_STOP_RADIUS_METERS) return
+        lastStopStation = station
+        lastStopSeen = true
+        gpsLeftStopMs = 0L
+        stationStops++
+        events.add("Stopped at ${station.name} (GPS)")
     }
 
     private fun noteSteps(sample: MotionSample) {
@@ -1049,7 +1200,7 @@ class UndergroundNavigator {
         val dv = recentDv(DEPARTURE_CONFIRM_WINDOW_MS)
         when {
             dv >= DEPARTURE_CONFIRM_DV_MPS && recentConsistency(DEPARTURE_CONFIRM_WINDOW_MS) >= DEPARTURE_MIN_CONSISTENCY &&
-                pushedFor(DEPARTURE_CONFIRM_WINDOW_MS) >= DEPARTURE_MIN_PUSH_MS -> speed = dv
+                pushedFor(DEPARTURE_CONFIRM_WINDOW_MS) >= DEPARTURE_MIN_PUSH_MS -> { speed = dv; speedMeasured = true }
             turning && !onLine -> {
                 speed = max(dv, TURN_DEPARTURE_SPEED_MPS)
                 events.add("Departure detected from a turn")
@@ -1057,13 +1208,21 @@ class UndergroundNavigator {
             onLine && unconfirmedMovingSec >= UNCONFIRMED_MOVING_ACCEPT_SEC -> {
                 // Moving-type vibration for this long without a departure signal: the stop was
                 // probably a smooth glide mis-read as still. Resume the model.
-                speed = cruiseSpeed * 0.5
+                if (onLine && !speedMeasured) departedAgo(UNCONFIRMED_MOVING_ACCEPT_SEC / 2) else speed = cruiseSpeed * 0.5
+                speedMeasured = false
                 events.add("Movement resumed without a clear departure (stop was probably misdetected)")
             }
             onLine && stoppedByPressure && pressureMovingSec >= PRESSURE_DEPARTED_SEC -> {
-                speed = cruiseSpeed * 0.5
+                departedAgo(PRESSURE_DEPARTED_SEC)
+                speedMeasured = false
                 velKnown = false // no push was measured: the integrated speed says nothing here
                 events.add("Departure seen from the pressure")
+            }
+            onLine && stoppedByStay && nowMs - stayLastMs > STAY_LEFT_MS -> {
+                departedAgo((nowMs - stayLastMs) / 2000.0) // it left some time after the last fix
+                speedMeasured = false
+                velKnown = false
+                events.add("Departure seen from the network fixes ending")
             }
             !onLine && drivingVibrationSec >= VIBRATION_RESTART_SEC -> {
                 speed = max(dv, cruiseSpeed * 0.5)
@@ -1073,8 +1232,59 @@ class UndergroundNavigator {
         }
         motionConfirmed = true
         stoppedByPressure = false
+        stoppedByStay = false
         inVehicle = true
         return true
+    }
+
+    /** The train left [sec] ago at this ride's speeding-up rate: the speed and the distance it has by now. */
+    private fun departedAgo(sec: Double) {
+        val rate = 1.0 / rampSecPerMps
+        val upSec = min(sec, topSpeed / rate)
+        speed = rate * upSec
+        val run = 0.5 * rate * upSec * upSec + topSpeed * max(0.0, sec - upSec)
+        movingSecondsSinceStop += sec
+        distanceSinceLoss += run
+        // Like any other step: undirected while the direction is unknown, held at the next station.
+        route?.takeIf { onTrack }?.let { r -> advanceAlongTrack(r, run) }
+    }
+
+    /** The station this run stops at next: not the one just left. */
+    private fun sectionEnd(r: MetroRoute): MetroStation? {
+        val first = r.nextStation(navDist, direction, tolerance = 0.0)
+        return if (first != null && first.name == lastStopStation?.name) r.nextStation(first.distanceAlongTrack, direction, tolerance = 0.0) else first
+    }
+
+    /** The speed a normal run has here: up to this ride's top speed, braking so as to stop at the next station. */
+    private fun profileSpeed(r: MetroRoute): Double {
+        val next = sectionEnd(r) ?: return topSpeed
+        val toGo = max(0.0, abs(next.distanceAlongTrack - navDist) - PROFILE_STOP_MARGIN_METERS)
+        val rate = 1.0 / rampSecPerMps
+        val curves = r.curveSpeedAhead(navDist, direction, CURVE_LATERAL_ACCEL, rate, CURVE_LOOKAHEAD_METERS)
+        return minOf(topSpeed, sqrt(2.0 * rate * toGo), curves)
+    }
+
+    /**
+     * The run has reached the next station but no stop was seen (a phone in the hand, no barometer):
+     * metro trains stop at nearly every station, so a normal stop is assumed, then the next run starts.
+     * The train may still be pulling in, so the estimate creeps on instead of freezing.
+     */
+    private fun waitAtStation(r: MetroRoute, station: MetroStation, dt: Double) {
+        assumedDwellSec += dt
+        val limit = station.distanceAlongTrack + direction * ASSUMED_CREEP_MAX_METERS
+        navDist = (if (direction > 0) min(navDist + ASSUMED_CREEP_MPS * dt, limit) else max(navDist - ASSUMED_CREEP_MPS * dt, limit)).coerceIn(0.0, r.length)
+        applyTrackPosition(r)
+        if (assumedDwellSec < ASSUMED_DWELL_SEC) return
+        assumedDwellSec = 0.0
+        waitingAt = null
+        navDist = station.distanceAlongTrack
+        lastStopStation = station
+        lastStopSeen = false
+        movingSecondsSinceStop = 0.0
+        clearHold()
+        uncertainty += ASSUMED_STOP_DOUBT_METERS
+        applyTrackPosition(r)
+        events.add("No stop seen at ${station.name}: assumed a normal stop there")
     }
 
     /** Riding with no saved line: IMU acceleration along the heading + pull toward this ride's cruise speed, fused with the inertial speed. */
@@ -1146,16 +1356,23 @@ class UndergroundNavigator {
      * be steady too, so it counts only near a station.
      */
     private fun stateWithPressure(s: MotionSample): MotionSample {
-        if (s.heightMeters.isNaN()) return s
+        if (s.heightMeters.isNaN()) {
+            // No reading (none, or the barometer went quiet): forget it, so nothing waits on it.
+            if (heightHistory.isNotEmpty()) { heightHistory.clear(); pressureSteady = false; pressureMovingSec = 0.0; stoppedByPressure = false }
+            return s
+        }
         heightHistory.addLast(doubleArrayOf(s.elapsedMs.toDouble(), s.heightMeters))
         while (s.elapsedMs - heightHistory.first()[0] > PRESSURE_STEADY_MS) heightHistory.removeFirst()
+        var lo = Double.MAX_VALUE; var hi = -Double.MAX_VALUE; var recentLo = Double.MAX_VALUE; var recentHi = -Double.MAX_VALUE
+        for (h in heightHistory) {
+            lo = min(lo, h[1]); hi = max(hi, h[1])
+            if (s.elapsedMs - h[0] <= PRESSURE_MOVING_WINDOW_MS) { recentLo = min(recentLo, h[1]); recentHi = max(recentHi, h[1]) }
+        }
         val spanMs = s.elapsedMs - heightHistory.first()[0]
-        val steady = spanMs >= PRESSURE_STEADY_MS * 0.9 &&
-            heightHistory.maxOf { it[1] } - heightHistory.minOf { it[1] } <= PRESSURE_STEADY_RANGE_METERS
+        val steady = spanMs >= PRESSURE_STEADY_MS * 0.9 && hi - lo <= PRESSURE_STEADY_RANGE_METERS
         if (steady && !pressureSteady) pressureSteadySinceMs = heightHistory.first()[0].toLong()
         pressureSteady = steady
-        val recent = heightHistory.filter { s.elapsedMs - it[0] <= PRESSURE_MOVING_WINDOW_MS }
-        val changing = recent.maxOf { it[1] } - recent.minOf { it[1] } > PRESSURE_MOVING_RANGE_METERS
+        val changing = recentHi - recentLo > PRESSURE_MOVING_RANGE_METERS
         pressureMovingSec = if (changing) pressureMovingSec + s.dtSec else 0.0
         val r = route?.takeIf { onTrack }
         if (gpsAvailable || r == null || s.state == MotionState.WALKING) { stoppedByPressure = false; return s }
@@ -1164,7 +1381,7 @@ class UndergroundNavigator {
         if (!staying) {
             // Just left a station: air settling behind the train is not another stop there.
             val nearest = listOfNotNull(r.nextStation(navDist, direction, tolerance = 0.0), r.nextStation(navDist, -direction, tolerance = 0.0))
-                .filter { it.name != lastStopStation?.name || movingSecondsSinceStop >= PRESSURE_LEFT_STATION_SEC }
+                .filter { it.name != lastStopStation?.name || !lastStopSeen || movingSecondsSinceStop >= PRESSURE_LEFT_STATION_SEC }
                 .minOfOrNull { abs(it.distanceAlongTrack - navDist) } ?: return s
             if (nearest > max(PRESSURE_STOP_RADIUS_METERS, min(PRESSURE_STOP_SIGMAS * uncertainty, PRESSURE_STOP_MAX_RADIUS_METERS))) return s
         }
@@ -1285,6 +1502,7 @@ class UndergroundNavigator {
                 return
             }
             events.add("Passed ${held.name} without stopping")
+            uncertainty += PASS_DOUBT_METERS // metro trains stop at nearly every station: a stop was probably missed
             navDist = (held.distanceAlongTrack + direction * pendingOvershoot).coerceIn(0.0, r.length)
             clearHold()
             applyTrackPosition(r)
@@ -1332,7 +1550,7 @@ class UndergroundNavigator {
         val aheadWindow = max(STOP_SNAP_AHEAD_MIN_METERS, segLen * STOP_SNAP_AHEAD_FRACTION) + pendingOvershoot
         // Well ahead of the train (after a restart, say) the estimate must still come back to the
         // station, or the error would last for the rest of the ride; but never to the one it left.
-        val behindWindow = if (prev?.name == lastStopStation?.name) STOP_SNAP_BEHIND_METERS
+        val behindWindow = if (prev?.name == lastStopStation?.name && lastStopSeen) STOP_SNAP_BEHIND_METERS
             else max(STOP_SNAP_BEHIND_METERS, min(HOLD_SIGMAS * uncertainty, segLen * OVERSHOOT_FRACTION))
         val candidates = listOfNotNull(
             next?.takeIf { abs(it.distanceAlongTrack - navDist) <= aheadWindow },
@@ -1341,7 +1559,8 @@ class UndergroundNavigator {
         // Odometer: the drift-corrected inertial distance since the last trusted station says
         // which station (if any) lies that far along. Better than the running estimate, which
         // can lag or lead after express passes and holds.
-        val byDistance = stationByRunDistance(r)
+        // The odometer counts measured motion: without a measured departure it knows nothing.
+        val byDistance = if (speedMeasured) stationByRunDistance(r) else null
         val station = when (byDistance) {
             null -> candidates.minByOrNull { abs(it.distanceAlongTrack - navDist) }?.takeIf { stationMoreLikelyThanSignalStop(it, segLen) }
             NO_STATION -> null
@@ -1352,17 +1571,35 @@ class UndergroundNavigator {
             return
         }
         // A stop placed by the odometer is a measurement, not a guess: the next run may use it as its start.
-        val trustedNow = uncertainty <= SNAP_TRUST_MAX_UNCERTAINTY_METERS || station === byDistance
-        finishSegment(r, station, trustedNow)
+        arriveAt(r, station, trusted = uncertainty <= SNAP_TRUST_MAX_UNCERTAINTY_METERS || station === byDistance, seenFromPressure = stillFromPressure)
+    }
+
+    /** The train stands at [station]: the position, the odometer and the speed of this run are settled. */
+    private fun arriveAt(r: MetroRoute, station: MetroStation, trusted: Boolean, seenFromPressure: Boolean) {
+        finishSegment(r, station, trusted)
         // Self-calibration: average moving speed over the last station-to-station run.
         val from = lastStopStation
-        if (from != null && from.name != station.name && movingSecondsSinceStop >= MIN_SEGMENT_SECONDS_FOR_LEARNING) {
-            val observed = abs(station.distanceAlongTrack - from.distanceAlongTrack) / movingSecondsSinceStop
+        val straightRun = from == null || r.curveSpeedBetween(from.distanceAlongTrack, station.distanceAlongTrack, CURVE_LATERAL_ACCEL) >= topSpeed
+        if (from != null && from.name != station.name && lastStopSeen && movingSecondsSinceStop >= MIN_SEGMENT_SECONDS_FOR_LEARNING) {
+            val meters = abs(station.distanceAlongTrack - from.distanceAlongTrack)
+            // A stop seen from the pressure is declared some seconds after the train came to rest.
+            val sec = movingSecondsSinceStop - if (seenFromPressure) PRESSURE_STEADY_MS / 1000.0 else 0.0
+            val observed = meters / sec
             if (observed in MIN_CRUISE_MPS..MAX_CRUISE_MPS) {
                 cruiseSpeed = (cruiseSpeed * 0.5 + observed * 0.5).coerceIn(MIN_CRUISE_MPS, MAX_CRUISE_MPS)
                 cruiseEvidence += CRUISE_EVIDENCE_NEEDED
             }
+            // The top speed that run needed, at this ride's speeding up and braking.
+            val disc = sec * sec - 4.0 * rampSecPerMps * meters
+            if (disc >= 0) {
+                val top = (sec - sqrt(disc)) / (2.0 * rampSecPerMps)
+                // Only a run no curve held back says how fast this train goes.
+                if (straightRun && top in MIN_TOP_SPEED_MPS..MAX_TOP_SPEED_MPS) topSpeed = (topSpeed + top) / 2
+            }
         }
+        lastStopSeen = true
+        assumedDwellSec = 0.0
+        waitingAt = null
         navDist = station.distanceAlongTrack
         clearHold()
         snappedAtStation = true
@@ -1443,6 +1680,7 @@ class UndergroundNavigator {
         if (strong) {
             // Only a vehicle pulls away this hard for this long.
             inVehicle = true
+            speedMeasured = true
             if (!motionConfirmed) {
                 motionConfirmed = true
                 speed = max(speed, sqrt(meanE * meanE + meanN * meanN) * departureTime)
@@ -1709,6 +1947,7 @@ class UndergroundNavigator {
     private fun correctDirection(r: MetroRoute, evidence: String) {
         navDist = (2 * directionSetAt - navDist).coerceIn(0.0, r.length)
         clearHold()
+        waitingAt = null
         setDirection(-direction)
         compassOffX = 0.0; compassOffY = 0.0 // learnt from departures in the wrong direction
         resetSegment()
@@ -1733,6 +1972,44 @@ class UndergroundNavigator {
     }
 
     // ---- Output ------------------------------------------------------------------------------
+
+    /**
+     * What the engine is doing and why, once a second in the log: enough to replay a real ride's
+     * decisions afterwards (speed method and its limits, the stop signals, what was learnt).
+     */
+    fun diagnostics(): String {
+        val r = route?.takeIf { onTrack }
+        val mode = when {
+            gpsAvailable -> "GPS"
+            !hasPosition -> "no position"
+            onFoot -> "on foot (steps)"
+            waitingAt != null -> "waiting at ${waitingAt?.name} (assumed stop ${"%.0f".format(Locale.US, assumedDwellSec)} s)"
+            motion == MotionState.STATIONARY && stillAccepted -> "standing"
+            r == null -> if (inVehicle) "vehicle, no line" else "no line, not in a vehicle"
+            !motionConfirmed -> "stopped, waiting for a departure"
+            speedMeasured || !directionKnown -> "measured speed"
+            else -> "line profile"
+        }
+        val line = if (r == null) "" else {
+            val end = sectionEnd(r)
+            val toGo = end?.let { abs(it.distanceAlongTrack - navDist) }
+            val rate = 1.0 / rampSecPerMps
+            String.format(Locale.US, " | along %.0f m, direction %s | next stop %s %s | limits: top %.1f, station %s, curve %s m/s (radius here %s)",
+                navDist, if (!directionKnown) "unknown" else if (directionUnconfirmed) "$direction unconfirmed" else "$direction",
+                end?.name ?: "none", toGo?.let { "%.0f m".format(Locale.US, it) } ?: "", topSpeed,
+                toGo?.let { "%.1f".format(Locale.US, sqrt(2.0 * rate * max(0.0, it - PROFILE_STOP_MARGIN_METERS))) } ?: "-",
+                r.curveSpeedAhead(navDist, direction, CURVE_LATERAL_ACCEL, rate, CURVE_LOOKAHEAD_METERS).takeIf { it < Double.MAX_VALUE }?.let { "%.1f".format(Locale.US, it) } ?: "none",
+                r.radiusAt(navDist).takeIf { it < 3_000.0 }?.let { "%.0f m".format(Locale.US, it) } ?: "straight")
+        }
+        return String.format(Locale.US,
+            "ENGINE: %s, speed %.1f m/s, error ±%.0f m%s | stop signals: pressure %s (changing %.0f s), phone still %s, vibration drop %s, stopped by %s | last stop %s (%s) | model: top %.1f, ramp %.2f, %s",
+            mode, speed, uncertainty, line,
+            if (heightHistory.isEmpty()) "none" else if (pressureSteady) "steady" else "moving", pressureMovingSec,
+            if (phoneStill) "yes" else "no", if (stillFromVibrationDrop) "yes" else "no",
+            listOfNotNull("pressure".takeIf { stoppedByPressure }, "network".takeIf { stoppedByStay }).joinToString("+").ifEmpty { "-" },
+            lastStopStation?.name ?: "none", if (lastStopSeen) "seen" else "assumed or unknown",
+            topSpeed, rampSecPerMps, if (runLearnt) "learnt" else "default")
+    }
 
     fun state(): NavState {
         val r = route
@@ -1799,6 +2076,34 @@ class UndergroundNavigator {
     companion object {
         // Speeds (m/s)
         const val DEFAULT_CRUISE_MPS = 12.0
+        /** A metro's normal run when this ride has shown none yet: 65 km/h, 1 m/s² speeding up and braking. */
+        const val DEFAULT_TOP_SPEED_MPS = 18.0
+        const val DEFAULT_RAMP_SEC_PER_MPS = 1.0
+        const val MIN_TOP_SPEED_MPS = 8.0
+        const val MAX_TOP_SPEED_MPS = 30.0
+        const val MIN_RAMP_SEC_PER_MPS = 0.4
+        const val MAX_RAMP_SEC_PER_MPS = 3.0
+        /** A GPS run starts above this speed and ends at a stop; shorter ones say nothing. */
+        const val RUN_MIN_MPS = 1.0
+        const val MIN_RUN_METERS = 200.0
+        const val RUN_MAX_GAP_SEC = 5.0
+        /** The braking may be this much harder than learnt, to stop where the station is. */
+        const val PROFILE_BRAKE_SLACK = 2.0
+        const val PROFILE_STOP_MARGIN_METERS = 3.0
+        /** Sideways acceleration a metro curve allows (track tilt included): v = √(this × radius). From Test1. */
+        const val CURVE_LATERAL_ACCEL = 1.5
+        /** Far enough to brake from top speed to the slowest curve. */
+        const val CURVE_LOOKAHEAD_METERS = 400.0
+        /** A run's top speed within this of a curve's limit was held back by that curve. */
+        const val CURVE_LIMIT_MARGIN_MPS = 1.0
+        /** Waiting at a station this slowly, this close, this long: a normal stop is assumed. */
+        const val ASSUMED_STOP_MAX_MPS = 0.5
+        const val ASSUMED_STOP_RADIUS_METERS = 20.0
+        const val ASSUMED_DWELL_SEC = 20.0
+        const val ASSUMED_STOP_DOUBT_METERS = 50.0
+        /** While waiting the estimate creeps on this slowly, at most this far past the station. */
+        const val ASSUMED_CREEP_MPS = 0.3
+        const val ASSUMED_CREEP_MAX_METERS = 8.0
         const val MIN_CRUISE_MPS = 5.0
         const val MAX_CRUISE_MPS = 30.0
         const val CRUISE_LEARN_MIN_MPS = 4.0
@@ -1827,7 +2132,17 @@ class UndergroundNavigator {
         /** What a mobile-cell fix is really worth, whatever it claims. */
         const val COARSE_FIX_ACCURACY_METERS = 1_500f
         /** Pressure steady this long, within this height: the train stands (near a station). */
-        const val PRESSURE_STEADY_MS = 10_000L
+        /** Fixes in a row, this close, this close in time, near a station: the train stands there. */
+        const val STAY_FIXES = 3
+        const val STAY_RADIUS_METERS = 100.0
+        const val STAY_MAX_GAP_MS = 15_000L
+        /** Such fixes come every 5–6 s: none for this long means the train has left. */
+        const val STAY_LEFT_MS = 8_000L
+        const val STAY_MAX_ACCURACY_METERS = 100f
+        const val STAY_STATION_RADIUS_METERS = 200.0
+        const val GPS_STOP_RADIUS_METERS = 120.0
+        const val PASS_DOUBT_METERS = 250.0
+        const val PRESSURE_STEADY_MS = 8_000L
         const val PRESSURE_STEADY_RANGE_METERS = 0.4
         const val PRESSURE_STOP_RADIUS_METERS = 200.0
         const val PRESSURE_STOP_MAX_RADIUS_METERS = 400.0
@@ -1835,7 +2150,8 @@ class UndergroundNavigator {
         /** Height moving by this much within the window, for this long: the train has left. */
         const val PRESSURE_MOVING_WINDOW_MS = 5_000L
         const val PRESSURE_MOVING_RANGE_METERS = 0.3
-        const val PRESSURE_DEPARTED_SEC = 8.0
+        const val PRESSURE_DEPARTED_SEC = 10.0
+        const val PRESSURE_VETO_SEC = 3.0
         const val PRESSURE_LEFT_STATION_SEC = 30.0
         /** Below this a jump of the GPS position says nothing about the direction of travel. */
         const val DIRECTION_FROM_MOTION_MIN_MPS = 1.0

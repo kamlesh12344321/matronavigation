@@ -335,6 +335,7 @@ object RouteJson {
         s.lastStation?.let { put("lastStation", it) }
         put("savedAt", s.savedAtMs)
         put("inVehicle", s.inVehicle); put("headingKnown", s.headingKnown)
+        put("topSpeed", s.topSpeedMps); put("ramp", s.rampSecPerMps); put("speedsLearnt", s.speedsLearnt)
     }.toString()
 
     /** Throws on malformed JSON. */
@@ -342,7 +343,9 @@ object RouteJson {
         RideState(optStringOrNull("route"), getDouble("lat"), getDouble("lon"), getDouble("along"), getInt("direction"),
             getBoolean("directionKnown"), getBoolean("directionUnconfirmed"), getDouble("heading"), getDouble("speed"),
             getDouble("cruise"), getDouble("error"), optStringOrNull("lastStation"), getLong("savedAt"),
-            optBoolean("inVehicle", true), optBoolean("headingKnown", true))
+            optBoolean("inVehicle", true), optBoolean("headingKnown", true),
+            optDouble("topSpeed", UndergroundNavigator.DEFAULT_TOP_SPEED_MPS), optDouble("ramp", UndergroundNavigator.DEFAULT_RAMP_SEC_PER_MPS),
+            optBoolean("speedsLearnt", false))
     }
 
     private fun JSONObject.optStringOrNull(key: String): String? =

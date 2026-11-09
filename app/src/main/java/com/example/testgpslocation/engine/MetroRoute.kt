@@ -148,6 +148,55 @@ class MetroRoute(
         out
     }
 
+    /**
+     * Fastest speed that the curves within [lookAhead] metres ahead allow, counting the braking
+     * ([brakeRate], m/s²) needed to be slow enough by each of them. A curve's own limit is
+     * √([lateralAccel] × radius); on straight track there is no limit (Double.MAX_VALUE).
+     */
+    fun curveSpeedAhead(distance: Double, direction: Int, lateralAccel: Double, brakeRate: Double, lookAhead: Double): Double {
+        var best = Double.MAX_VALUE
+        var k = 0.0
+        while (k <= lookAhead) {
+            val radius = radiusAt(distance + direction * k)
+            if (radius < STRAIGHT_RADIUS_METERS) best = minOf(best, sqrt(lateralAccel * radius + 2.0 * brakeRate * k))
+            k += CURVE_STEP_METERS
+        }
+        return best
+    }
+
+    /** Slowest curve speed between two distances (either order): what limits a run there. */
+    fun curveSpeedBetween(a: Double, b: Double, lateralAccel: Double): Double {
+        var best = Double.MAX_VALUE
+        var s = minOf(a, b)
+        while (s <= maxOf(a, b)) {
+            val radius = radiusAt(s)
+            if (radius < STRAIGHT_RADIUS_METERS) best = minOf(best, sqrt(lateralAccel * radius))
+            s += CURVE_STEP_METERS
+        }
+        return best
+    }
+
+    /** Curve radius (m) at [distance]: the turn between the 30 m of track before it and after it. */
+    fun radiusAt(distance: Double): Double {
+        if (radii.isEmpty()) return Double.MAX_VALUE
+        val i = (distance.coerceIn(0.0, length) / CURVE_STEP_METERS).toInt().coerceIn(0, radii.size - 1)
+        return radii[i]
+    }
+
+    private val radii: DoubleArray by lazy {
+        if (points.size < 2 || length < 2 * CURVE_CHORD_METERS) return@lazy DoubleArray(0)
+        DoubleArray((length / CURVE_STEP_METERS).toInt() + 1) { i ->
+            val s = i * CURVE_STEP_METERS
+            if (s < CURVE_CHORD_METERS || s > length - CURVE_CHORD_METERS) return@DoubleArray Double.MAX_VALUE
+            val p0 = pointAt(s - CURVE_CHORD_METERS); val p1 = pointAt(s); val p2 = pointAt(s + CURVE_CHORD_METERS)
+            var turn = GeoToolbox.calculateBearing(p1.lat, p1.lon, p2.lat, p2.lon) - GeoToolbox.calculateBearing(p0.lat, p0.lon, p1.lat, p1.lon)
+            if (turn > 180) turn -= 360
+            if (turn < -180) turn += 360
+            val rad = Math.toRadians(kotlin.math.abs(turn))
+            if (rad < 1e-6) Double.MAX_VALUE else maxOf(MIN_CURVE_RADIUS_METERS, CURVE_CHORD_METERS / rad)
+        }
+    }
+
     private fun segmentIndex(distance: Double): Int {
         var lo = 0; var hi = points.size - 1
         while (lo < hi) {
@@ -164,6 +213,12 @@ class MetroRoute(
         private const val MIN_TURN_SEGMENT_METERS = 2.0
         /** A sharper bend between two mapped segments is a mapping artefact, not a track curve. */
         private const val MAX_VERTEX_TURN_DEG = 100.0
+        private const val CURVE_STEP_METERS = 10.0
+        private const val CURVE_CHORD_METERS = 30.0
+        /** Tighter than this is a mapping kink, not a metro curve. */
+        private const val MIN_CURVE_RADIUS_METERS = 60.0
+        /** Wider than this is straight track for any metro speed. */
+        private const val STRAIGHT_RADIUS_METERS = 3_000.0
     }
 }
 

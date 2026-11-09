@@ -540,6 +540,7 @@ class MainActivity : AppCompatActivity() {
             caps != null && !caps.hasRotationVector ->
                 Warning("No orientation sensor: pick your destination so the direction of travel is known.", null)
             s.mockLocation -> Warning("Mock (fake) GPS locations detected; results are not real.", null)
+            caps != null && !caps.hasBarometer -> Warning("This phone has no barometer: stops in a tunnel will be harder to see.", null)
             !hasStepPermission() -> Warning("Allow Physical activity so walking can be followed without GPS.") { openAppSettings() }
             else -> null
         }

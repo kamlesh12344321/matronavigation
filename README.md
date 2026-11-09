@@ -12,7 +12,7 @@ Two Android apps sharing one library:
 
 ```bash
 ./gradlew assembleDebug          # build both apps
-./gradlew testDebugUnitTest      # 137 unit, edge-case, test-drive, long-tunnel simulation and real-ride replay tests
+./gradlew testDebugUnitTest      # 146 unit, edge-case, test-drive, long-tunnel simulation and real-ride replay tests
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb install -r gpslogger/build/outputs/apk/debug/gpslogger-debug.apk
 ```

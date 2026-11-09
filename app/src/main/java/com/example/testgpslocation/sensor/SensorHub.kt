@@ -40,7 +40,8 @@ data class DeviceCapabilities(
     val hasLinearAcceleration: Boolean,
     val hasAccelerometer: Boolean,
     val hasRotationVector: Boolean,
-    val hasGyroscope: Boolean
+    val hasGyroscope: Boolean,
+    val hasBarometer: Boolean
 )
 
 /**
@@ -85,6 +86,7 @@ class SensorHub(context: Context) : SensorEventListener {
     private val rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private val pressure = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
+    private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
     private val hasGnss = try { locationManager.allProviders.contains(LocationManager.GPS_PROVIDER) } catch (_: Exception) { false }
     private val hasPlayServices = try {
@@ -99,7 +101,8 @@ class SensorHub(context: Context) : SensorEventListener {
         hasLinearAcceleration = linearAccel != null,
         hasAccelerometer = rawAccel != null,
         hasRotationVector = rotationVector != null,
-        hasGyroscope = gyroscope != null
+        hasGyroscope = gyroscope != null,
+        hasBarometer = pressure != null
     )
 
     var listener: Listener? = null
@@ -128,6 +131,16 @@ class SensorHub(context: Context) : SensorEventListener {
     // Rolling buffers for classification
     private val accelMagnitudes = RingBuffer(ROLLING_SAMPLES)
     private val gyroMagnitudes = RingBuffer(ROLLING_SAMPLES)
+
+    // Logged only, to judge after a ride whether they show stops better
+    private val magneticMagnitudes = RingBuffer(ROLLING_SAMPLES)
+    private val accelChanges = RingBuffer(ROLLING_SAMPLES)
+    private var lastAccelMagnitude = Double.NaN
+    /** Spread of the magnetic field over ~2 s (µT): train motors should disturb it, a standing train less. */
+    val magneticSpread: Double get() = magneticMagnitudes.std() ?: Double.NaN
+    /** Spread of the change from sample to sample (m/s²): rails shake fast, a hand slowly. */
+    val fastVibration: Double get() = accelChanges.std() ?: Double.NaN
+
     private var stillSinceMs = 0L
     // Turn rate about the vertical (gravity) axis: magnetometer independent
     private var yawSum = 0.0
@@ -138,6 +151,9 @@ class SensorHub(context: Context) : SensorEventListener {
 
     // Barometer: height change since the sensors started (metres), null without a barometer
     private var startHeightMeters = Float.NaN
+    private var lastPressureMs = 0L
+    /** Last barometer reading (hPa), for the log. */
+    var lastPressureHpa = Float.NaN; private set
     var heightChangeMeters: Double? = null; private set
 
     private val gpsWatchdog = object : Runnable {
@@ -243,6 +259,7 @@ class SensorHub(context: Context) : SensorEventListener {
         rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         gyroscope?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         pressure?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler) }
+        magnetometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         ensureStepSensor()
         handler.postDelayed(gpsWatchdog, 1000L)
         isRunning = true
@@ -364,6 +381,10 @@ class SensorHub(context: Context) : SensorEventListener {
                 }
             }
             Sensor.TYPE_PRESSURE -> onPressure(event.values[0])
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                val x = event.values[0]; val y = event.values[1]; val z = event.values[2]
+                magneticMagnitudes.add(sqrt((x * x + y * y + z * z).toDouble()))
+            }
             Sensor.TYPE_STEP_DETECTOR -> { stepsInWindow++; stepCount++ }
         }
     }
@@ -371,7 +392,10 @@ class SensorHub(context: Context) : SensorEventListener {
     private fun onAccel(xf: Float, yf: Float, zf: Float) {
         val x = xf.toDouble(); val y = yf.toDouble(); val z = zf.toDouble()
         if (x.isNaN() || y.isNaN() || z.isNaN()) return
-        accelMagnitudes.add(sqrt(x * x + y * y + z * z))
+        val magnitude = sqrt(x * x + y * y + z * z)
+        accelMagnitudes.add(magnitude)
+        if (!lastAccelMagnitude.isNaN()) accelChanges.add(magnitude - lastAccelMagnitude)
+        lastAccelMagnitude = magnitude
         if (hasRotation) {
             // Rotation matrix maps device coordinates to world (East, North, Up).
             sumEast += rotation[0] * x + rotation[1] * y + rotation[2] * z
@@ -397,7 +421,8 @@ class SensorHub(context: Context) : SensorEventListener {
             yawRateDps = if (yawCount > 0) -Math.toDegrees(yawSum / yawCount) else Double.NaN,
             vibration = accelMagnitudes.std() ?: Double.NaN,
             steps = stepsInWindow,
-            heightMeters = heightChangeMeters ?: Double.NaN
+            // An old reading would look like a perfectly steady pressure: only fresh ones count.
+            heightMeters = heightChangeMeters?.takeIf { now - lastPressureMs <= PRESSURE_STALE_MS } ?: Double.NaN
         )
         windowStartMs = now; sumEast = 0.0; sumNorth = 0.0; windowCount = 0
         yawSum = 0.0; yawCount = 0; stepsInWindow = 0
@@ -426,6 +451,8 @@ class SensorHub(context: Context) : SensorEventListener {
         if (hPa.isNaN() || hPa <= 0f) return
         val height = SensorManager.getAltitude(SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hPa)
         if (startHeightMeters.isNaN()) startHeightMeters = height
+        lastPressureMs = SystemClock.elapsedRealtime()
+        lastPressureHpa = hPa
         heightChangeMeters = (height - startHeightMeters).toDouble()
     }
 
@@ -458,6 +485,7 @@ class SensorHub(context: Context) : SensorEventListener {
         private const val STALE_FIX_MS = 10_000L
         private const val NO_GNSS_TRUSTED_ACCURACY = 25f
         private const val CHIP_ESTIMATE_MIN_ACCURACY = 50f
+        private const val PRESSURE_STALE_MS = 2_000L
         /** Fused sent nothing for this long: the network provider takes over. */
         private const val FUSED_SILENT_MS = 10_000L
         private const val LAST_KNOWN_MIN_ACCURACY = 1_000f

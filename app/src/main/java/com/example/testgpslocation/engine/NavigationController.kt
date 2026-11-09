@@ -90,6 +90,7 @@ object NavigationController : SensorHub.Listener {
     /** Fixes arrive about 1 s apart; a strict 1 s gap dropped every fix that came a little early. */
     private const val MIN_GPS_EVENT_GAP_MS = 500L
     private const val NO_GPS_ROW_MS = 1_000L
+    private const val DIAG_INTERVAL_MS = 1_000L
     private const val TEST_ROUTES_DIR = "test_routes"
     /** The current ride, to carry on after a restart. */
     private const val RIDE_STATE_FILE = "ride_state.json"
@@ -136,8 +137,8 @@ object NavigationController : SensorHub.Listener {
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val messages: SharedFlow<String> = _messages
 
-    private val _fixLog = MutableSharedFlow<String>(extraBufferCapacity = 64)
-    /** One line for every network or no-satellite fix: where it said, and whether it was used. */
+    private val _fixLog = MutableSharedFlow<String>(extraBufferCapacity = 256)
+    /** Every location fix (GPS, network, no-satellite) with what became of it, and the engine diagnostics once a second. */
     val fixLog: SharedFlow<String> = _fixLog
 
     private val _cachedLines = MutableStateFlow(0)
@@ -158,6 +159,7 @@ object NavigationController : SensorHub.Listener {
     private var lastPublishMs = 0L
     private var lastEventMs = 0L
     private var lastMotion: MotionSample? = null
+    private var lastDiagMs = 0L
     /** Only new positions are logged and marked (plus a row every 30 s while standing). */
     private val deduper = PositionDeduper()
 
@@ -408,7 +410,10 @@ object NavigationController : SensorHub.Listener {
             return
         }
         val outcome = navigator.onLocationFix(point, now)
-        if (!point.isGnss) _fixLog.tryEmit(String.format(Locale.US, "%s FIX: %.6f, %.6f ±%.0f m | %s",
+        _fixLog.tryEmit(if (point.isGnss) String.format(Locale.US, "GPS FIX: %.6f, %.6f ±%.0f m, speed %s, bearing %s, satellites %d | %s",
+            point.latitude, point.longitude, point.accuracy, if (point.hasSpeed) "%.2f m/s".format(Locale.US, point.speedMeterPerSecond) else "-",
+            if (point.hasBearing) "%.0f°".format(Locale.US, point.bearingDegree) else "-", _satellites.value.usedInFix, outcome)
+        else String.format(Locale.US, "%s FIX: %.6f, %.6f ±%.0f m | %s",
             if (point.isChipEstimate) "NO-SATELLITE GPS" else "NETWORK", point.latitude, point.longitude, point.accuracy, outcome))
         if (navigator.hasFix) maybeLookupLines(navigator.currentLat, navigator.currentLon, now)
         drainMessages()
@@ -442,6 +447,17 @@ object NavigationController : SensorHub.Listener {
         publish(force = false)
         if (!navigator.isGpsAvailable && navigator.hasFix && sample.elapsedMs - lastEventMs >= NO_GPS_ROW_MS) emitPosition(sample.elapsedMs)
         if (sample.elapsedMs - lastRideSaveMs >= RIDE_SAVE_INTERVAL_MS) saveRideState(sample.elapsedMs)
+        if (sample.elapsedMs - lastDiagMs >= DIAG_INTERVAL_MS) logDiagnostics(sample)
+    }
+
+    /** Once a second, whatever the position rows do: the engine's reasoning and the raw sensors. */
+    private fun logDiagnostics(s: MotionSample) {
+        lastDiagMs = s.elapsedMs
+        val sats = _satellites.value
+        _fixLog.tryEmit(navigator.diagnostics() + String.format(Locale.US,
+            " | RAW: %s, vibration %.3f, fast vibration %.3f, accel E %+.3f N %+.3f m/s², turn %+.1f °/s, pressure %.2f hPa (height %+.2f m), magnetic spread %.2f µT, steps %d, satellites %d/%d",
+            s.state.name.lowercase(), s.vibration, sensorHub.fastVibration, s.accelEast, s.accelNorth, s.yawRateDps,
+            sensorHub.lastPressureHpa, s.heightMeters, sensorHub.magneticSpread, sensorHub.stepCount, sats.usedInFix, sats.inView))
     }
 
     override fun onSatellites(inView: Int, usedInFix: Int) {
@@ -615,8 +631,9 @@ object NavigationController : SensorHub.Listener {
             reference?.latitude, reference?.longitude, error,
             sensors = listOfNotNull(
                 lastMotion?.let {
-                    String.format(Locale.US, "Sensors: %s, vibration %.3f m/s², turn %+.1f °/s, steps %d, accel E %+.2f N %+.2f m/s²",
-                        it.state.name.lowercase(), it.vibration, it.yawRateDps, sensorHub.stepCount, it.accelEast, it.accelNorth)
+                    String.format(Locale.US, "Sensors: %s, vibration %.3f m/s², turn %+.1f °/s, steps %d, accel E %+.2f N %+.2f m/s², fast vibration %.3f, magnetic spread %.2f µT",
+                        it.state.name.lowercase(), it.vibration, it.yawRateDps, sensorHub.stepCount, it.accelEast, it.accelNorth,
+                        sensorHub.fastVibration, sensorHub.magneticSpread)
                 },
                 // The serving mobile cell: the coverage along the route.
                 cellScanner.servingCell?.let { "Cell: $it" }

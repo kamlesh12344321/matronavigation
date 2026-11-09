@@ -68,7 +68,8 @@ class UndergroundNavigatorTest {
         val s = nav.state()
         assertEquals(77.0, s.longitude, 1e-9) // constrained to the track
         assertTrue("moved north: ${s.latitude}", s.latitude > 12.9025)
-        assertTrue(s.distanceSinceGpsLossMeters in 250.0..400.0)
+        // From 10 m/s towards a normal metro top speed, none learnt yet.
+        assertTrue("${s.distanceSinceGpsLossMeters} m", s.distanceSinceGpsLossMeters in 300.0..600.0)
     }
 
     @Test
@@ -85,26 +86,31 @@ class UndergroundNavigatorTest {
     }
 
     @Test
-    fun estimateSlowsAtNextStationButKeepsMovingUntilTheTrainStops() {
+    fun aRealStopAfterAnAssumedOneStillSnapsToTheStation() {
         enterTunnelMovingNorth()
-        run(MotionState.MOVING, 115.0) // would overshoot B by ~100 m
-        val nearB = nav.state().latitude
-        assertEquals("slowed down at B, not 100 m past it", 12.91, nearB, 25.0 / 111_195.0)
-        // The train has not stopped, so the coordinates must keep changing (no frozen rows).
+        // Nothing measured: the estimate brakes into B, waits a normal stop there, and goes on.
+        run(MotionState.MOVING, 80.0)
+        val waiting = nav.state().latitude
+        assertEquals("waiting at B", 12.91, waiting, 10.0 / 111_195.0)
         run(MotionState.MOVING, 1.0)
-        assertTrue("still moving", nav.state().latitude > nearB)
+        assertTrue("creeping, not frozen", nav.state().latitude > waiting)
+        run(MotionState.MOVING, 34.0)
+        assertTrue(nav.events.toString(), nav.events.any { it.startsWith("No stop seen at B") })
+        // The train really was slower and stops at B now: the estimate goes back there.
         run(MotionState.STATIONARY, 6.0)
         assertEquals("B", nav.state().previousStation)
         assertEquals(12.91, nav.state().latitude, 1e-4)
     }
 
     @Test
-    fun skippedStationIsReleasedAfterLargeOvershoot() {
+    fun withNothingMeasuredANormalStopIsAssumedAtEachStation() {
+        // No orientation sensor, no stop seen: metro trains stop at nearly every station, so the
+        // estimate waits a normal stop at B and then goes on. (A measured run can still pass one.)
         enterTunnelMovingNorth()
-        run(MotionState.MOVING, 170.0) // far beyond B without stopping
+        run(MotionState.MOVING, 130.0)
         val s = nav.state()
         assertEquals("C", s.nextStation)
-        assertTrue(nav.events.any { it.contains("Passed B") })
+        assertTrue(nav.events.toString(), nav.events.any { it.startsWith("No stop seen at B") })
     }
 
     @Test

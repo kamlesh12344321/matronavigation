@@ -126,7 +126,7 @@ class UndergroundScenarioTest {
     fun smoothCruiseReadAsStillIsNotTakenForAStop() {
         val r = ride("false-stills", SimConfig(falseStillEverySec = 15.0, seed = 5))
         assertEquals(allStops, r.stationsAtStops)
-        val stops = r.events.count { it.startsWith("Stopped at") }
+        val stops = r.events.count { it.startsWith("Stopped at") && !it.endsWith("(GPS)") }
         assertEquals("one stop per station: ${r.events.filter { it.startsWith("Stopped") }}", allStops.size, stops)
         assertTrue("max moving error ${r.maxMovingError}", r.maxMovingError < 400.0)
     }
@@ -260,7 +260,7 @@ class UndergroundScenarioTest {
         assertEquals(s, RouteJson.readRide(RouteJson.writeRide(s)))
         val noLine = s.copy(routeId = null, lastStation = null)
         assertEquals(noLine, RouteJson.readRide(RouteJson.writeRide(noLine)))
-        val onFoot = s.copy(inVehicle = false, headingKnown = false)
+        val onFoot = s.copy(inVehicle = false, headingKnown = false, topSpeedMps = 16.5, rampSecPerMps = 0.9, speedsLearnt = true)
         assertEquals(onFoot, RouteJson.readRide(RouteJson.writeRide(onFoot)))
     }
 

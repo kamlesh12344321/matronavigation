@@ -91,6 +91,7 @@ object NavigationController : SensorHub.Listener {
     private const val MIN_GPS_EVENT_GAP_MS = 500L
     private const val NO_GPS_ROW_MS = 1_000L
     private const val DIAG_INTERVAL_MS = 1_000L
+    private const val SENSOR_GAP_MS = 1_500L
     private const val TEST_ROUTES_DIR = "test_routes"
     /** The current ride, to carry on after a restart. */
     private const val RIDE_STATE_FILE = "ride_state.json"
@@ -160,6 +161,10 @@ object NavigationController : SensorHub.Listener {
     private var lastEventMs = 0L
     private var lastMotion: MotionSample? = null
     private var lastDiagMs = 0L
+    private var lastMotionMs = 0L
+    private var diagSumE = 0.0
+    private var diagSumN = 0.0
+    private var diagCount = 0
     /** Only new positions are logged and marked (plus a row every 30 s while standing). */
     private val deduper = PositionDeduper()
 
@@ -441,6 +446,11 @@ object NavigationController : SensorHub.Listener {
     }
 
     override fun onMotionSample(sample: MotionSample) {
+        // Android may pause the sensors (doze, a phone too hot): the log must show it.
+        if (lastMotionMs != 0L && sample.elapsedMs - lastMotionMs > SENSOR_GAP_MS)
+            _fixLog.tryEmit(String.format(Locale.US, "GAP: no motion data for %.1f s", (sample.elapsedMs - lastMotionMs) / 1000.0))
+        lastMotionMs = sample.elapsedMs
+        diagSumE += sample.accelEast; diagSumN += sample.accelNorth; diagCount++
         lastMotion = sample
         navigator.onMotion(sample)
         drainMessages()
@@ -455,9 +465,39 @@ object NavigationController : SensorHub.Listener {
         lastDiagMs = s.elapsedMs
         val sats = _satellites.value
         _fixLog.tryEmit(navigator.diagnostics() + String.format(Locale.US,
-            " | RAW: %s, vibration %.3f, fast vibration %.3f, accel E %+.3f N %+.3f m/s², turn %+.1f °/s, pressure %.2f hPa (height %+.2f m), magnetic spread %.2f µT, steps %d, satellites %d/%d",
-            s.state.name.lowercase(), s.vibration, sensorHub.fastVibration, s.accelEast, s.accelNorth, s.yawRateDps,
+            " | RAW: %s, vibration %.3f, fast vibration %.3f, accel E %+.3f N %+.3f m/s² (1 s average), turn %+.1f °/s, pressure %.3f hPa (height %+.2f m), magnetic spread %.2f µT, steps %d, satellites %d/%d",
+            s.state.name.lowercase(), s.vibration, sensorHub.fastVibration, diagSumE / max(1, diagCount), diagSumN / max(1, diagCount), s.yawRateDps,
             sensorHub.lastPressureHpa, s.heightMeters, sensorHub.magneticSpread, sensorHub.stepCount, sats.usedInFix, sats.inView))
+        diagSumE = 0.0; diagSumN = 0.0; diagCount = 0
+    }
+
+    /** The tester's own mark of a real stop or departure, with what the app estimated at that moment. */
+    fun markByUser(stopped: Boolean) {
+        if (!::sensorHub.isInitialized) return
+        val s = navigator.state()
+        val text = if (stopped) "Train stopped (marked by you)" else "Train left (marked by you)"
+        _fixLog.tryEmit(String.format(Locale.US, "MARK: %s | app estimate %.6f, %.6f, %s, speed %.1f m/s, error ±%.0f m, next %s | %s",
+            text, s.latitude, s.longitude, s.source.label, s.speedMps, s.uncertaintyMeters, s.nextStation ?: "-", navigator.diagnostics()))
+        if (navigator.hasFix) _mapEvents.value = (_mapEvents.value + MapEvent(System.currentTimeMillis(), navigator.currentLat, navigator.currentLon, text)).takeLast(MAX_MAP_EVENTS)
+    }
+
+    /** Everything about the phone and its settings that changes how the app behaves: first lines of each log. */
+    fun sessionInfo(context: Context): List<String> {
+        val caps = capabilities
+        val pm = context.getSystemService(android.os.PowerManager::class.java)
+        val version = try { context.packageManager.getPackageInfo(context.packageName, 0).versionName } catch (_: Exception) { "?" }
+        fun yn(b: Boolean?) = when (b) { true -> "yes"; false -> "no"; null -> "?" }
+        val sm = context.getSystemService(android.hardware.SensorManager::class.java)
+        fun has(type: Int) = yn(sm?.getDefaultSensor(type) != null)
+        return listOf(
+            "SESSION: app $version, phone ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})",
+            "SENSORS: GPS ${yn(caps?.hasGnss)}, Google Play services ${yn(caps?.hasPlayServices)}, linear acceleration ${yn(caps?.hasLinearAcceleration)}, accelerometer ${yn(caps?.hasAccelerometer)}, " +
+                "rotation vector ${yn(caps?.hasRotationVector)}, gyroscope ${yn(caps?.hasGyroscope)}, barometer ${yn(caps?.hasBarometer)}, " +
+                "step detector ${has(android.hardware.Sensor.TYPE_STEP_DETECTOR)}, magnetometer ${has(android.hardware.Sensor.TYPE_MAGNETIC_FIELD)}",
+            "SETTINGS: location on ${yn(isLocationEnabled)}, network location on ${yn(isNetworkLocationEnabled)}, precise location ${yn(::sensorHub.isInitialized && sensorHub.hasFineLocationPermission())}, " +
+                "physical activity ${yn(com.example.testgpslocation.sensor.SensorHub.hasStepPermission(context))}, battery optimisation off ${yn(pm?.isIgnoringBatteryOptimizations(context.packageName))}",
+            "LINE DATA: ${_cachedLines.value} lines on the phone; now ${navigator.route?.lineName ?: "no line"}"
+        )
     }
 
     override fun onSatellites(inView: Int, usedInFix: Int) {

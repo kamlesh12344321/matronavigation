@@ -84,6 +84,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var offlineText: TextView
     private lateinit var confidenceVal: TextView
     private lateinit var btnLogging: Button
+    private lateinit var btnMark: Button
     private lateinit var logFileText: TextView
     private lateinit var testDriveBar: View
     private lateinit var testDriveText: TextView
@@ -131,6 +132,7 @@ class MainActivity : AppCompatActivity() {
         offlineText = findViewById(R.id.offlineText)
         confidenceVal = findViewById(R.id.confidenceVal)
         btnLogging = findViewById(R.id.btnLogging)
+        btnMark = findViewById(R.id.btnMark)
         testDriveBar = findViewById(R.id.testDriveBar)
         testDriveText = findViewById(R.id.testDriveText)
         btnTestDrivePrimary = findViewById(R.id.btnTestDrivePrimary)
@@ -154,6 +156,14 @@ class MainActivity : AppCompatActivity() {
         btnRecenter.setOnClickListener { setFollowing(true); centreOnPosition(fromButton = true) }
         btnTestDrivePrimary.setOnClickListener { onTestDrivePrimary() }
         btnTestDriveSecondary.setOnClickListener { onTestDriveSecondary() }
+
+        // While testing: tap when the train really stops and when it leaves. The log then has the
+        // real times next to what the app estimated, without writing them down by hand.
+        btnMark.setOnClickListener {
+            val stopped = btnMark.text == getString(R.string.mark_stop)
+            NavigationController.markByUser(stopped)
+            btnMark.setText(if (stopped) R.string.mark_leave else R.string.mark_stop)
+        }
 
         btnLogging.setOnClickListener {
             if (LocationTrackerService.isRunning.value) {
@@ -180,6 +190,7 @@ class MainActivity : AppCompatActivity() {
                     LocationTrackerService.isRunning.collect { running ->
                         btnLogging.setText(if (running) R.string.stop_logging else R.string.start_logging)
                         btnLogging.setTextColor(if (running) STOP_COLOR else START_COLOR)
+                        btnMark.visibility = if (running) View.VISIBLE else View.GONE
                         logFileText.text = TelemetryLogger.currentFileName?.let { getString(R.string.log_current_file, TelemetryLogger.FOLDER_DESCRIPTION, it) }
                             ?: getString(R.string.log_new_file_each_start, TelemetryLogger.FOLDER_DESCRIPTION)
                         refreshWarnings()

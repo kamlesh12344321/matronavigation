@@ -346,6 +346,17 @@
                 android:textSize="12sp" />
 
             <Button
+                android:id="@+id/btnMark"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:text="@string/mark_stop"
+                android:textColor="#FFFFFF"
+                android:textSize="12sp"
+                android:visibility="gone" />
+
+            <Button
                 android:id="@+id/btnLogging"
                 style="?android:attr/buttonBarButtonStyle"
                 android:layout_width="wrap_content"

@@ -61,7 +61,8 @@ class MetroRouteService(context: Context) {
      * Lines already on the phone (e.g. a newer download) are kept.
      */
     private fun importBundledLocked(routes: MutableList<MetroRoute>) {
-        val names = try { appContext.assets.list(BUNDLE_DIR)?.filter { it.endsWith(".json.gz") } } catch (e: Exception) { null }
+        // The build packs "x.json.gz" as plain "x.json" (it drops the .gz and unpacks it): accept both.
+        val names = try { appContext.assets.list(BUNDLE_DIR)?.filter { it.endsWith(".json.gz") || it.endsWith(".json") } } catch (e: Exception) { null }
         if (names.isNullOrEmpty()) return
         val stamp = try {
             appContext.packageManager.getPackageInfo(appContext.packageName, 0).lastUpdateTime.toString()
@@ -73,7 +74,8 @@ class MetroRouteService(context: Context) {
             val key = "$name@$stamp"
             if (key in done) continue
             try {
-                val json = GZIPInputStream(appContext.assets.open("$BUNDLE_DIR/$name")).bufferedReader().use { it.readText() }
+                val raw = appContext.assets.open("$BUNDLE_DIR/$name")
+                val json = (if (name.endsWith(".gz")) GZIPInputStream(raw) else raw).bufferedReader().use { it.readText() }
                 val lines = OverpassParser.parseAll(json)
                 lines.forEach { route ->
                     if (routes.none { it.id == route.id }) { routes.add(route); save(route) }

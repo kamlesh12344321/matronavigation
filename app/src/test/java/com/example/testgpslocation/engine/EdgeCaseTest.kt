@@ -459,6 +459,16 @@ class EdgeCaseTest {
     }
 
     @Test
+    fun theLogShowsTheAccelerationAlongTheTrackEachSecond() {
+        standingAtStationBThenLeaving()
+        nav.diagnostics()
+        riding(1.0) { 2.0 }
+        val d = nav.diagnostics()
+        assertTrue(d, d.contains("accel along track +0.00 m/s² (min +0.00, max +0.00, 10 samples)"))
+        assertFalse("reset after each line", nav.diagnostics().contains("accel along track"))
+    }
+
+    @Test
     fun aSteadyPressureNearAStationIsAStopEvenInTheHand() {
         standingAtStationBThenLeaving()
         riding(15.0) { 2.0 }

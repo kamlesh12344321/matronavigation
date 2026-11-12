@@ -67,6 +67,7 @@ class LocationTrackerService : Service() {
         TelemetryLogger.startSession(this) // every start of logging gets its own file
         isRunning.value = true
         TelemetryLogger.logCustom(this, "Logging started")
+        NavigationController.sessionInfo(this).forEach { TelemetryLogger.logCustom(this, it) }
 
         scope.launch {
             NavigationController.positions.collect { p ->
@@ -106,6 +107,12 @@ class LocationTrackerService : Service() {
             NavigationController.fixLog.collect { TelemetryLogger.logCustom(this@LocationTrackerService, it) }
         }
         scope.launch {
+            while (isActive) { // battery and heat: what an unattended box needs watching for
+                TelemetryLogger.logCustom(this@LocationTrackerService, deviceHealth())
+                delay(DEVICE_LOG_MS)
+            }
+        }
+        scope.launch {
             NavigationController.state.collect { s ->
                 val text = buildString {
                     append(s.status)
@@ -115,6 +122,17 @@ class LocationTrackerService : Service() {
                 updateNotification(text)
             }
         }
+    }
+
+    private fun deviceHealth(): String {
+        val battery = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = battery?.let { b -> b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) * 100 / b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1) } ?: -1
+        val plugged = (battery?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
+        val tempC = (battery?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }?.let { it / 10.0 }
+        val pm = getSystemService(PowerManager::class.java)
+        val thermal = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) pm?.currentThermalStatus?.toString() ?: "?" else "?"
+        return String.format(java.util.Locale.US, "DEVICE: battery %d%%, charging %s, battery temperature %s °C, thermal status %s (0 = none, 3+ = the phone may slow down), screen %s",
+            level, if (plugged) "yes" else "no", tempC?.let { "%.1f".format(java.util.Locale.US, it) } ?: "?", thermal, if (pm?.isInteractive == true) "on" else "off")
     }
 
     private fun updateNotification(text: String) {
@@ -172,5 +190,6 @@ class LocationTrackerService : Service() {
         private const val CLIENT = "service"
         private const val MAX_WAKE_LOCK_MS = 12 * 60 * 60 * 1000L // safety cap: 12 h, renewed while logging
         private const val WAKE_LOCK_RENEW_MS = 60 * 60 * 1000L
+        private const val DEVICE_LOG_MS = 60_000L
     }
 }

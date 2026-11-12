@@ -7,6 +7,9 @@
     <string name="flip_direction">Flip ⇄</string>
     <string name="start_logging">Start logging</string>
     <string name="stop_logging">Stop logging</string>
+    <!-- Tap when the train really stops / leaves: the real times, written into the log -->
+    <string name="mark_stop">Mark stop</string>
+    <string name="mark_leave">Mark leave</string>
     <string name="auto_direction">Destination: auto (direction of travel)</string>
     <string name="permission_needed">Location permission is required</string>
     <string name="fix">Fix</string>

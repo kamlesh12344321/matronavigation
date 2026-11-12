@@ -197,6 +197,11 @@ class UndergroundNavigator {
     private var assumedDwellSec = 0.0
     /** Waiting at this station on the profile: no stop seen, a normal one is assumed. */
     private var waitingAt: MetroStation? = null
+    // For the log: acceleration along the track since the last diagnostics line
+    private var diagAlongSum = 0.0
+    private var diagAlongMin = Double.MAX_VALUE
+    private var diagAlongMax = -Double.MAX_VALUE
+    private var diagAlongCount = 0
     /** The speed comes from a measured departure (a push the accelerometer saw), so it can be trusted. */
     private var speedMeasured = false
     /** The last stop was seen (sensors, pressure, network), not assumed. */
@@ -920,6 +925,12 @@ class UndergroundNavigator {
         // Remove the accelerometer bias measured while the train stood still.
         val sample = if (raw.orientationKnown) raw.copy(accelEast = raw.accelEast - accBiasE, accelNorth = raw.accelNorth - accBiasN) else raw
         motion = sample.state
+        route?.takeIf { onTrack && directionKnown && sample.orientationKnown }?.let { r ->
+            val b = Math.toRadians(r.bearingAt(navDist, direction) + compassOffsetDeg)
+            val along = sample.accelEast * sin(b) + sample.accelNorth * cos(b)
+            diagAlongSum += along; diagAlongCount++
+            diagAlongMin = min(diagAlongMin, along); diagAlongMax = max(diagAlongMax, along)
+        }
         accelMeasured = sample.orientationKnown
         if (sample.state == MotionState.WALKING) walkingSeconds += dt else walkingSeconds = 0.0
         if (gpsAvailable && gnssAccelSign != 0 && sample.orientationKnown) {
@@ -2001,9 +2012,12 @@ class UndergroundNavigator {
                 r.curveSpeedAhead(navDist, direction, CURVE_LATERAL_ACCEL, rate, CURVE_LOOKAHEAD_METERS).takeIf { it < Double.MAX_VALUE }?.let { "%.1f".format(Locale.US, it) } ?: "none",
                 r.radiusAt(navDist).takeIf { it < 3_000.0 }?.let { "%.0f m".format(Locale.US, it) } ?: "straight")
         }
+        val accel = if (diagAlongCount == 0) "" else String.format(Locale.US, " | accel along track %+.2f m/s² (min %+.2f, max %+.2f, %d samples)",
+            diagAlongSum / diagAlongCount, diagAlongMin, diagAlongMax, diagAlongCount)
+        diagAlongSum = 0.0; diagAlongCount = 0; diagAlongMin = Double.MAX_VALUE; diagAlongMax = -Double.MAX_VALUE
         return String.format(Locale.US,
-            "ENGINE: %s, speed %.1f m/s, error ±%.0f m%s | stop signals: pressure %s (changing %.0f s), phone still %s, vibration drop %s, stopped by %s | last stop %s (%s) | model: top %.1f, ramp %.2f, %s",
-            mode, speed, uncertainty, line,
+            "ENGINE: %s, speed %.1f m/s, error ±%.0f m%s%s | stop signals: pressure %s (changing %.0f s), phone still %s, vibration drop %s, stopped by %s | last stop %s (%s) | model: top %.1f, ramp %.2f, %s",
+            mode, speed, uncertainty, line, accel,
             if (heightHistory.isEmpty()) "none" else if (pressureSteady) "steady" else "moving", pressureMovingSec,
             if (phoneStill) "yes" else "no", if (stillFromVibrationDrop) "yes" else "no",
             listOfNotNull("pressure".takeIf { stoppedByPressure }, "network".takeIf { stoppedByStay }).joinToString("+").ifEmpty { "-" },

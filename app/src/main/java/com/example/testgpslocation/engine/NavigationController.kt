@@ -7,7 +7,6 @@ import android.net.Network
 import android.os.SystemClock
 import android.util.Log
 import com.example.testgpslocation.models.GpsPoint
-import com.example.testgpslocation.sensor.CellScanner
 import com.example.testgpslocation.sensor.DeviceCapabilities
 import com.example.testgpslocation.sensor.SensorHub
 import com.example.testgpslocation.utils.GeoToolbox
@@ -23,10 +22,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
-import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToLong
 
@@ -39,43 +35,8 @@ data class PositionEvent(
     val latitude: Double,
     val longitude: Double,
     val source: PositionSource,
-    val speedMps: Double,
-    val gpsAvailable: Boolean,
-    val uncertaintyMeters: Double,
-    val gpsAccuracyMeters: Float?,
-    val satellitesUsed: Int,
-    val lineName: String?,
-    val nextStation: String?,
-    val mock: Boolean,
-    /** Tunnel test only: the real GPS position at the same moment and the estimate's distance from it. */
-    val truthLatitude: Double? = null,
-    val truthLongitude: Double? = null,
-    val errorMeters: Double? = null,
-    /** What the motion sensors saw (state, vibration, turn rate): for tuning stop and curve detection. */
-    val sensors: String? = null,
-    /** Height from GPS; null without GPS. */
-    val altitudeMeters: Double? = null,
-    /** Direction of travel, degrees from north; null until it is known. */
-    val headingDeg: Double? = null,
-    /** Barometer: height change since the sensors started; null without a barometer. */
-    val heightChangeMeters: Double? = null
+    val speedMps: Double
 )
-
-data class Satellites(val inView: Int = 0, val usedInFix: Int = 0)
-
-/** A position marker on the map: every listed position, coloured by where it came from. */
-data class TrailPoint(
-    val timestamp: Long,
-    val latitude: Double,
-    val longitude: Double,
-    val source: PositionSource,
-    val uncertaintyMeters: Double,
-    val speedMps: Double,
-    val nextStation: String?
-)
-
-/** A navigation event (station stop, GPS lost, line change…) at the position where it happened. */
-data class MapEvent(val timestamp: Long, val latitude: Double, val longitude: Double, val text: String)
 
 /**
  * Process-wide owner of the sensors, the navigator and the metro line cache. Runs while at
@@ -90,18 +51,11 @@ object NavigationController : SensorHub.Listener {
     /** Fixes arrive about 1 s apart; a strict 1 s gap dropped every fix that came a little early. */
     private const val MIN_GPS_EVENT_GAP_MS = 500L
     private const val NO_GPS_ROW_MS = 1_000L
-    private const val DIAG_INTERVAL_MS = 1_000L
-    private const val SENSOR_GAP_MS = 1_500L
-    private const val TEST_ROUTES_DIR = "test_routes"
     /** The current ride, to carry on after a restart. */
     private const val RIDE_STATE_FILE = "ride_state.json"
     private const val RIDE_SAVE_INTERVAL_MS = 5_000L
     /** A saved ride older than this says nothing about where the train is now. */
     private const val RIDE_RESUME_MAX_AGE_MS = 5 * 60_000L
-    /** A real-GPS reference older than this is not compared with the estimate. */
-    private const val TRUTH_MAX_AGE_MS = 3_000L
-    private const val TRUTH_TRAIL_SPACING_METERS = 5.0
-    private const val MAX_MAP_EVENTS = 300
     private const val LOOKUP_INTERVAL_MS = 10_000L
     private const val LOOKUP_DISTANCE_METERS = 200.0
     private const val INITIAL_BACKOFF_MS = 30_000L
@@ -111,7 +65,6 @@ object NavigationController : SensorHub.Listener {
 
     private lateinit var appContext: Context
     private lateinit var sensorHub: SensorHub
-    private lateinit var cellScanner: CellScanner
     private lateinit var routeService: MetroRouteService
     private val navigator = UndergroundNavigator()
     private val errorHandler = CoroutineExceptionHandler { _, e -> Log.e(TAG, "Background task failed", e) }
@@ -122,11 +75,8 @@ object NavigationController : SensorHub.Listener {
     val state: StateFlow<NavState> = _state
 
     /** Positions to mark on the map, oldest first. */
-    private val _trail = MutableStateFlow<List<TrailPoint>>(emptyList())
-    val trail: StateFlow<List<TrailPoint>> = _trail
-
-    private val _mapEvents = MutableStateFlow<List<MapEvent>>(emptyList())
-    val mapEvents: StateFlow<List<MapEvent>> = _mapEvents
+    private val _trail = MutableStateFlow<List<PositionEvent>>(emptyList())
+    val trail: StateFlow<List<PositionEvent>> = _trail
 
     /** The metro line being followed, for drawing it. */
     private val _route = MutableStateFlow<MetroRoute?>(null)
@@ -135,21 +85,10 @@ object NavigationController : SensorHub.Listener {
     private val _positions = MutableSharedFlow<PositionEvent>(extraBufferCapacity = 128)
     val positions: SharedFlow<PositionEvent> = _positions
 
-    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 64)
-    val messages: SharedFlow<String> = _messages
-
-    private val _fixLog = MutableSharedFlow<String>(extraBufferCapacity = 256)
-    /** Every location fix (GPS, network, no-satellite) with what became of it, and the engine diagnostics once a second. */
-    val fixLog: SharedFlow<String> = _fixLog
-
     private val _cachedLines = MutableStateFlow(0)
-    val cachedLines: StateFlow<Int> = _cachedLines
 
     private val _lineStatus = MutableStateFlow("Metro line data: checking…")
     val lineStatus: StateFlow<String> = _lineStatus
-
-    private val _satellites = MutableStateFlow(Satellites())
-    val satellites: StateFlow<Satellites> = _satellites
 
     val capabilities: DeviceCapabilities? get() = if (::sensorHub.isInitialized) sensorHub.capabilities else null
     val isLocationEnabled: Boolean get() = !::sensorHub.isInitialized || sensorHub.isLocationEnabled()
@@ -159,37 +98,8 @@ object NavigationController : SensorHub.Listener {
     private var rideStateSaved = false
     private var lastPublishMs = 0L
     private var lastEventMs = 0L
-    private var lastMotion: MotionSample? = null
-    private var lastDiagMs = 0L
-    private var lastMotionMs = 0L
-    private var diagSumE = 0.0
-    private var diagSumN = 0.0
-    private var diagCount = 0
     /** Only new positions are logged and marked (plus a row every 30 s while standing). */
     private val deduper = PositionDeduper()
-
-    // Test drive (no metro needed): see TestDriveMode
-    /** Test-drive routes, kept apart from the metro lines so a recorded road is never taken for one. */
-    private lateinit var testRoutesDir: File
-    private var testMode = TestDriveMode.OFF
-    private var recorder: TestRouteRecorder? = null
-    private var testRoute: MetroRoute? = null
-    /** Tunnel test: the latest real GPS fix (never given to navigation) and when it came. */
-    private var truth: GpsPoint? = null
-    private var truthReceivedMs = 0L
-    // Tunnel test: estimate vs. real GPS (count, sum, max, latest in metres)
-    private var errorCount = 0
-    private var errorSum = 0.0
-    private var errorMax = 0.0
-    private var errorLast: Double? = null
-    private val errorMean: Double? get() = if (errorCount == 0) null else errorSum / errorCount
-
-    private val _testDrive = MutableStateFlow(TestDriveState())
-    val testDrive: StateFlow<TestDriveState> = _testDrive
-
-    /** Tunnel test: the real GPS path, to draw under the estimate. */
-    private val _truthTrail = MutableStateFlow<List<TrackPoint>>(emptyList())
-    val truthTrail: StateFlow<List<TrackPoint>> = _truthTrail
 
     // Offline lookup throttling
     private var lookupJob: Job? = null
@@ -206,9 +116,7 @@ object NavigationController : SensorHub.Listener {
         if (::appContext.isInitialized) return
         appContext = context.applicationContext
         sensorHub = SensorHub(appContext).also { it.listener = this }
-        cellScanner = CellScanner(appContext)
         routeService = MetroRouteService(appContext)
-        testRoutesDir = File(appContext.filesDir, TEST_ROUTES_DIR)
         scope.launch {
             _lineStatus.value = "Metro line data: loading offline lines…"
             _cachedLines.value = routeService.preload()
@@ -226,7 +134,7 @@ object NavigationController : SensorHub.Listener {
         check(::appContext.isInitialized) { "call init() first" }
         clients.add(client)
         val ok = sensorHub.start()
-        if (!ok) clients.remove(client) else cellScanner.start()
+        if (!ok) clients.remove(client)
         return ok
     }
 
@@ -234,7 +142,6 @@ object NavigationController : SensorHub.Listener {
         clients.remove(client)
         if (clients.isEmpty() && ::sensorHub.isInitialized) {
             sensorHub.stop()
-            cellScanner.stop()
         }
     }
 
@@ -242,8 +149,7 @@ object NavigationController : SensorHub.Listener {
     fun restartSensors() {
         if (!::sensorHub.isInitialized || clients.isEmpty()) return
         sensorHub.stop()
-        cellScanner.stop()
-        if (sensorHub.start()) cellScanner.start()
+        sensorHub.start()
     }
 
     /** The step permission may have been granted in Settings while the app was away. */
@@ -251,175 +157,20 @@ object NavigationController : SensorHub.Listener {
         if (::sensorHub.isInitialized && sensorHub.isRunning) sensorHub.ensureStepSensor()
     }
 
-    fun setDestination(index: Int?) { navigator.setDestination(index); drainMessages(); publish(force = true) }
-    fun flipDirection() { navigator.flipDirection(); drainMessages(); publish(force = true) }
-
-    /** Download lines around the current position now, even if this area was downloaded before. */
-    fun refreshLinesHere() = startDownload(force = true, radius = MetroRouteService.SEARCH_RADIUS_METERS)
-
-    /** Download every metro line within ~30 km (whole city) for offline use. */
+    /** Download every metro line within ~30 km (whole city) now, even if this area was downloaded before. */
     fun downloadCity() = startDownload(force = true, radius = MetroRouteService.CITY_RADIUS_METERS)
 
-    /** Removes the position and event markers (the log file keeps them). */
+    /** Removes the position markers (the log file keeps them). */
     fun clearMap() {
         _trail.value = emptyList()
-        _mapEvents.value = emptyList()
         deduper.reset() // the current position gets a marker again
-    }
-
-    // ---- Test drive (no metro needed) -------------------------------------------------------
-
-    /** Saved test routes, newest first (small files, read on demand). */
-    fun savedTestRoutes(): List<MetroRoute> = if (!::testRoutesDir.isInitialized) emptyList() else
-        (testRoutesDir.listFiles { f -> f.extension == "json" } ?: emptyArray())
-            .sortedByDescending { it.lastModified() }
-            .mapNotNull { f -> try { RouteJson.read(f.readText()) } catch (e: Exception) { null } }
-
-    fun deleteTestRoutes() {
-        if (::testRoutesDir.isInitialized) testRoutesDir.listFiles()?.forEach { it.delete() }
-    }
-
-    /** First trip: record the road and its stops with GPS. */
-    fun startRecordingTestRoute() {
-        endTestDrive()
-        recorder = TestRouteRecorder()
-        testMode = TestDriveMode.RECORDING
-        note("Test drive: recording the route with GPS")
-        publishTestDrive()
-    }
-
-    /** A station where the vehicle is now; false without a fix yet or with a station this close. */
-    fun markTestStation(): Boolean = (recorder?.markStation() ?: false).also { if (it) publishTestDrive() }
-
-    /** Saves the recorded route and starts following it; null when it is too short. */
-    fun finishRecordingTestRoute(): MetroRoute? {
-        val r = recorder ?: return null
-        recorder = null
-        val name = "Test route " + SimpleDateFormat("d MMM HH:mm", Locale.US).format(Date())
-        val route = r.build("test_${System.currentTimeMillis()}", name)
-        if (route == null) {
-            testMode = TestDriveMode.OFF
-            note(String.format(Locale.US, "Test drive: route too short to use (%.0f m, needs %.0f m)", r.lengthMeters, TestRouteRecorder.MIN_ROUTE_METERS))
-            publishTestDrive()
-            return null
-        }
-        note(if (saveTestRoute(route)) String.format(Locale.US, "Test drive: saved %s (%.1f km, %d stations)",
-            route.lineName, route.length / 1000.0, route.stations.size) else "Test drive: could not save the route (storage full?)")
-        rideTestRoute(route)
-        return route
-    }
-
-    /** A later trip on a recorded route; GPS is still used until [startTunnelTest]. */
-    fun rideTestRoute(route: MetroRoute) {
-        endTunnelTest()
-        recorder = null
-        testRoute = route
-        testMode = TestDriveMode.READY
-        navigator.setAlternativeRoutes(emptyList()) // a nearby metro line must not take over
-        navigator.setRoute(route)
-        drainMessages()
-        publishTestDrive()
-        publish(force = true)
-    }
-
-    /** Hides GPS from navigation, as in a tunnel; GPS is kept only to measure the error. */
-    fun startTunnelTest(): Boolean {
-        if (testMode != TestDriveMode.READY || !navigator.hasFix) return false
-        testMode = TestDriveMode.TUNNEL
-        errorCount = 0; errorSum = 0.0; errorMax = 0.0; errorLast = null
-        truth = null
-        _truthTrail.value = emptyList()
-        navigator.onGpsLost(SystemClock.elapsedRealtime())
-        note("Tunnel test started: navigating without GPS")
-        publishTestDrive()
-        publish(force = true)
-        return true
-    }
-
-    /** GPS is used again; the next fix reports how far off the estimate was. */
-    fun endTunnelTest() {
-        if (testMode != TestDriveMode.TUNNEL) return
-        testMode = TestDriveMode.READY
-        errorMean?.let {
-            note(String.format(Locale.US, "Tunnel test ended: %d comparisons with real GPS, error mean %.0f m, max %.0f m", errorCount, it, errorMax))
-        }
-        truth = null
-        publishTestDrive()
-    }
-
-    fun endTestDrive() {
-        endTunnelTest()
-        val wasActive = testMode != TestDriveMode.OFF
-        recorder = null
-        testRoute = null
-        testMode = TestDriveMode.OFF
-        if (wasActive) {
-            navigator.setRoute(null)
-            note("Test drive ended")
-            if (navigator.hasFix) maybeLookupLines(navigator.currentLat, navigator.currentLon, SystemClock.elapsedRealtime(), force = true)
-        }
-        publishTestDrive()
-        publish(force = true)
-    }
-
-    /** Temp file + rename, so a full disk never leaves half a route. */
-    private fun saveTestRoute(route: MetroRoute): Boolean = try {
-        if (!testRoutesDir.exists()) testRoutesDir.mkdirs()
-        val tmp = File(testRoutesDir, "${route.id}.json.tmp")
-        tmp.writeText(RouteJson.write(route))
-        tmp.renameTo(File(testRoutesDir, "${route.id}.json")).also { if (!it) tmp.delete() }
-    } catch (e: Exception) {
-        false
-    }
-
-    private fun recordTruth(point: GpsPoint, now: Long) {
-        truth = point
-        truthReceivedMs = now
-        val last = _truthTrail.value.lastOrNull()
-        if (last == null || GeoToolbox.calculateDistance(last.lat, last.lon, point.latitude, point.longitude) >= TRUTH_TRAIL_SPACING_METERS) {
-            _truthTrail.value = (_truthTrail.value + TrackPoint(point.latitude, point.longitude)).takeLast(MAX_TRAIL_POINTS)
-        }
-    }
-
-    private fun publishTestDrive() {
-        val r = recorder
-        _testDrive.value = TestDriveState(
-            mode = testMode,
-            routeName = testRoute?.lineName,
-            recordedMeters = r?.lengthMeters ?: 0.0,
-            recordedStations = r?.stationCount ?: 0,
-            lastErrorMeters = errorLast,
-            meanErrorMeters = errorMean,
-            maxErrorMeters = if (errorCount > 0) errorMax else null,
-            comparisons = errorCount
-        )
-    }
-
-    /** A message from the controller itself, logged and marked like the navigator's events. */
-    private fun note(message: String) {
-        navigator.events.add(message)
-        drainMessages()
     }
 
     // ---- SensorHub.Listener ------------------------------------------------------------
 
     override fun onLocationFix(point: GpsPoint) {
         val now = SystemClock.elapsedRealtime()
-        if (point.isGnss) recorder?.let {
-            it.onFix(point.latitude, point.longitude, point.accuracy, if (point.hasSpeed) point.speedMeterPerSecond else null, point.elapsedRealtimeMs)
-            publishTestDrive()
-        }
-        if (testMode == TestDriveMode.TUNNEL) {
-            // Tunnel test: navigation never sees the fix; it is only the reference for the error.
-            if (point.isGnss && !point.isMock) recordTruth(point, now)
-            return
-        }
-        val outcome = navigator.onLocationFix(point, now)
-        _fixLog.tryEmit(if (point.isGnss) String.format(Locale.US, "GPS FIX: %.6f, %.6f ±%.0f m, speed %s, bearing %s, satellites %d | %s",
-            point.latitude, point.longitude, point.accuracy, if (point.hasSpeed) "%.2f m/s".format(Locale.US, point.speedMeterPerSecond) else "-",
-            if (point.hasBearing) "%.0f°".format(Locale.US, point.bearingDegree) else "-", _satellites.value.usedInFix, outcome)
-        else String.format(Locale.US, "%s FIX: %.6f, %.6f ±%.0f m | %s",
-            if (point.isChipEstimate) "NO-SATELLITE GPS" else "NETWORK", point.latitude, point.longitude, point.accuracy, outcome))
+        navigator.onLocationFix(point, now)
         if (navigator.hasFix) maybeLookupLines(navigator.currentLat, navigator.currentLon, now)
         drainMessages()
         publish(force = true)
@@ -429,10 +180,9 @@ object NavigationController : SensorHub.Listener {
 
     /** Only as a starting point: anything better that has arrived wins. */
     override fun onLastKnownFix(point: GpsPoint) {
-        if (navigator.hasFix || testMode == TestDriveMode.TUNNEL) return
+        if (navigator.hasFix) return
         val now = SystemClock.elapsedRealtime()
-        val outcome = navigator.onLocationFix(point, now)
-        _fixLog.tryEmit(String.format(Locale.US, "LAST KNOWN FIX: %.6f, %.6f ±%.0f m | %s", point.latitude, point.longitude, point.accuracy, outcome))
+        navigator.onLocationFix(point, now)
         if (navigator.hasFix) maybeLookupLines(navigator.currentLat, navigator.currentLon, now)
         drainMessages()
         publish(force = true)
@@ -446,71 +196,20 @@ object NavigationController : SensorHub.Listener {
     }
 
     override fun onMotionSample(sample: MotionSample) {
-        // Android may pause the sensors (doze, a phone too hot): the log must show it.
-        if (lastMotionMs != 0L && sample.elapsedMs - lastMotionMs > SENSOR_GAP_MS)
-            _fixLog.tryEmit(String.format(Locale.US, "GAP: no motion data for %.1f s", (sample.elapsedMs - lastMotionMs) / 1000.0))
-        lastMotionMs = sample.elapsedMs
-        diagSumE += sample.accelEast; diagSumN += sample.accelNorth; diagCount++
-        lastMotion = sample
         navigator.onMotion(sample)
         drainMessages()
         publish(force = false)
         if (!navigator.isGpsAvailable && navigator.hasFix && sample.elapsedMs - lastEventMs >= NO_GPS_ROW_MS) emitPosition(sample.elapsedMs)
         if (sample.elapsedMs - lastRideSaveMs >= RIDE_SAVE_INTERVAL_MS) saveRideState(sample.elapsedMs)
-        if (sample.elapsedMs - lastDiagMs >= DIAG_INTERVAL_MS) logDiagnostics(sample)
-    }
-
-    /** Once a second, whatever the position rows do: the engine's reasoning and the raw sensors. */
-    private fun logDiagnostics(s: MotionSample) {
-        lastDiagMs = s.elapsedMs
-        val sats = _satellites.value
-        _fixLog.tryEmit(navigator.diagnostics() + String.format(Locale.US,
-            " | RAW: %s, vibration %.3f, fast vibration %.3f, accel E %+.3f N %+.3f m/s² (1 s average), turn %+.1f °/s, pressure %.3f hPa (height %+.2f m), magnetic spread %.2f µT, steps %d, satellites %d/%d",
-            s.state.name.lowercase(), s.vibration, sensorHub.fastVibration, diagSumE / max(1, diagCount), diagSumN / max(1, diagCount), s.yawRateDps,
-            sensorHub.lastPressureHpa, s.heightMeters, sensorHub.magneticSpread, sensorHub.stepCount, sats.usedInFix, sats.inView))
-        diagSumE = 0.0; diagSumN = 0.0; diagCount = 0
-    }
-
-    /** The tester's own mark of a real stop or departure, with what the app estimated at that moment. */
-    fun markByUser(stopped: Boolean) {
-        if (!::sensorHub.isInitialized) return
-        val s = navigator.state()
-        val text = if (stopped) "Train stopped (marked by you)" else "Train left (marked by you)"
-        _fixLog.tryEmit(String.format(Locale.US, "MARK: %s | app estimate %.6f, %.6f, %s, speed %.1f m/s, error ±%.0f m, next %s | %s",
-            text, s.latitude, s.longitude, s.source.label, s.speedMps, s.uncertaintyMeters, s.nextStation ?: "-", navigator.diagnostics()))
-        if (navigator.hasFix) _mapEvents.value = (_mapEvents.value + MapEvent(System.currentTimeMillis(), navigator.currentLat, navigator.currentLon, text)).takeLast(MAX_MAP_EVENTS)
-    }
-
-    /** Everything about the phone and its settings that changes how the app behaves: first lines of each log. */
-    fun sessionInfo(context: Context): List<String> {
-        val caps = capabilities
-        val pm = context.getSystemService(android.os.PowerManager::class.java)
-        val version = try { context.packageManager.getPackageInfo(context.packageName, 0).versionName } catch (_: Exception) { "?" }
-        fun yn(b: Boolean?) = when (b) { true -> "yes"; false -> "no"; null -> "?" }
-        val sm = context.getSystemService(android.hardware.SensorManager::class.java)
-        fun has(type: Int) = yn(sm?.getDefaultSensor(type) != null)
-        return listOf(
-            "SESSION: app $version, phone ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})",
-            "SENSORS: GPS ${yn(caps?.hasGnss)}, Google Play services ${yn(caps?.hasPlayServices)}, linear acceleration ${yn(caps?.hasLinearAcceleration)}, accelerometer ${yn(caps?.hasAccelerometer)}, " +
-                "rotation vector ${yn(caps?.hasRotationVector)}, gyroscope ${yn(caps?.hasGyroscope)}, barometer ${yn(caps?.hasBarometer)}, " +
-                "step detector ${has(android.hardware.Sensor.TYPE_STEP_DETECTOR)}, magnetometer ${has(android.hardware.Sensor.TYPE_MAGNETIC_FIELD)}",
-            "SETTINGS: location on ${yn(isLocationEnabled)}, network location on ${yn(isNetworkLocationEnabled)}, precise location ${yn(::sensorHub.isInitialized && sensorHub.hasFineLocationPermission())}, " +
-                "physical activity ${yn(com.example.testgpslocation.sensor.SensorHub.hasStepPermission(context))}, battery optimisation off ${yn(pm?.isIgnoringBatteryOptimizations(context.packageName))}",
-            "LINE DATA: ${_cachedLines.value} lines on the phone; now ${navigator.route?.lineName ?: "no line"}"
-        )
-    }
-
-    override fun onSatellites(inView: Int, usedInFix: Int) {
-        _satellites.value = Satellites(inView, usedInFix)
     }
 
     // ---- Carrying on after a restart -------------------------------------------------------
 
-    /** A test drive's route is not among the saved lines, and with GPS there is nothing to recover. */
+    /** With GPS there is nothing to recover. */
     private fun saveRideState(now: Long) {
         lastRideSaveMs = now
         val file = File(appContext.filesDir, RIDE_STATE_FILE)
-        val state = if (testMode == TestDriveMode.OFF) navigator.rideState(System.currentTimeMillis()) else null
+        val state = navigator.rideState(System.currentTimeMillis())
         if (state == null) {
             if (rideStateSaved) scope.launch(Dispatchers.IO) { file.delete() }
             rideStateSaved = false
@@ -550,7 +249,6 @@ object NavigationController : SensorHub.Listener {
 
     /** Offline lookup (cheap, no network): pick the nearest saved line and the alternatives. */
     private fun maybeLookupLines(lat: Double, lon: Double, now: Long, force: Boolean = false) {
-        if (testRoute != null) return // a test drive follows its own route
         if (lookupJob?.isActive == true) return
         val moved = GeoToolbox.calculateDistance(lastLookupLat, lastLookupLon, lat, lon)
         if (!force && lastLookupMs != 0L && now - lastLookupMs < LOOKUP_INTERVAL_MS && moved < LOOKUP_DISTANCE_METERS) return
@@ -589,7 +287,7 @@ object NavigationController : SensorHub.Listener {
         val now = SystemClock.elapsedRealtime()
         if (!force && now < nextDownloadAttemptMs) return
         val lat = navigator.currentLat; val lon = navigator.currentLon
-        _lineStatus.value = if (radius > MetroRouteService.SEARCH_RADIUS_METERS) "Metro line data: downloading the whole city… (can take a few minutes)"
+        _lineStatus.value = if (radius > MetroRouteService.SEARCH_RADIUS_METERS) "Metro line data: downloading lines near you, then the whole city…"
         else "Metro line data: downloading lines near you…"
         downloadJob = scope.launch {
             val result = routeService.download(lat, lon, radius, force)
@@ -598,8 +296,8 @@ object NavigationController : SensorHub.Listener {
                 is DownloadResult.Saved -> {
                     downloadBackoffMs = INITIAL_BACKOFF_MS
                     nextDownloadAttemptMs = 0L
-                    _lineStatus.value = "Metro line data: saved ${result.lines} line(s) — works offline"
-                    _messages.tryEmit("Saved ${result.lines} metro line(s) for offline use")
+                    _lineStatus.value = if (result.wholeCity) "Metro line data: saved ${result.lines} line(s) — works offline"
+                    else "Metro line data: saved ${result.lines} line(s) near you — works offline (whole city not available yet)"
                     maybeLookupLines(navigator.currentLat, navigator.currentLon, SystemClock.elapsedRealtime(), force = true)
                 }
                 DownloadResult.AlreadyDownloaded -> {
@@ -620,12 +318,6 @@ object NavigationController : SensorHub.Listener {
                     nextDownloadAttemptMs = SystemClock.elapsedRealtime() + downloadBackoffMs
                     _lineStatus.value = "Metro line data: download failed (${result.reason}); retrying in ${downloadBackoffMs / 1000} s"
                     downloadBackoffMs = min(downloadBackoffMs * 2, MAX_BACKOFF_MS)
-                    if (radius > MetroRouteService.SEARCH_RADIUS_METERS) {
-                        // A whole city can be too big for a busy server: save the lines around us now,
-                        // the city is retried later with back-off.
-                        downloadJob = null
-                        startDownload(force = true, radius = MetroRouteService.SEARCH_RADIUS_METERS)
-                    }
                 }
             }
         }
@@ -655,50 +347,16 @@ object NavigationController : SensorHub.Listener {
         lastEventMs = elapsedMs
         val s = navigator.state()
         if (s.source == PositionSource.NONE) return
-        // Tunnel test: compare with the real GPS position of the same moment.
-        val reference = truth?.takeIf { testMode == TestDriveMode.TUNNEL && elapsedMs - truthReceivedMs <= TRUTH_MAX_AGE_MS }
-        val error = reference?.let { GeoToolbox.calculateDistance(s.latitude, s.longitude, it.latitude, it.longitude) }
-        if (error != null) {
-            errorCount++; errorSum += error; errorLast = error; errorMax = max(errorMax, error)
-            publishTestDrive()
-        }
         val decision = deduper.decide(s.latitude, s.longitude, elapsedMs)
-        // Same position as the last row: skipped, except in a tunnel test where the error still changes.
-        if (decision == PositionDeduper.Decision.SKIP && error == null) return
-        val event = PositionEvent(
-            System.currentTimeMillis(), s.latitude, s.longitude, s.source, s.speedMps, s.gpsAvailable,
-            s.uncertaintyMeters, s.gpsAccuracyMeters, _satellites.value.usedInFix, s.lineName, s.nextStation, s.mockLocation,
-            reference?.latitude, reference?.longitude, error,
-            sensors = listOfNotNull(
-                lastMotion?.let {
-                    String.format(Locale.US, "Sensors: %s, vibration %.3f m/s², turn %+.1f °/s, steps %d, accel E %+.2f N %+.2f m/s², fast vibration %.3f, magnetic spread %.2f µT",
-                        it.state.name.lowercase(), it.vibration, it.yawRateDps, sensorHub.stepCount, it.accelEast, it.accelNorth,
-                        sensorHub.fastVibration, sensorHub.magneticSpread)
-                },
-                // The serving mobile cell: the coverage along the route.
-                cellScanner.servingCell?.let { "Cell: $it" }
-            ).joinToString(" | ").ifEmpty { null },
-            altitudeMeters = s.gpsAltitudeMeters,
-            headingDeg = s.headingDeg.takeIf { s.headingKnown },
-            heightChangeMeters = sensorHub.heightChangeMeters
-        )
+        if (decision == PositionDeduper.Decision.SKIP) return // same position as the last row
+        val event = PositionEvent(System.currentTimeMillis(), s.latitude, s.longitude, s.source, s.speedMps)
         _positions.tryEmit(event)
         if (decision != PositionDeduper.Decision.LOG_AND_MARK) return
-        _trail.value = (_trail.value + TrailPoint(event.timestamp, event.latitude, event.longitude, event.source,
-            event.uncertaintyMeters, event.speedMps, event.nextStation)).takeLast(MAX_TRAIL_POINTS)
+        _trail.value = (_trail.value + event).takeLast(MAX_TRAIL_POINTS)
     }
 
-    private fun drainMessages() {
-        if (navigator.events.isEmpty()) return
-        navigator.events.forEach { _messages.tryEmit(it) }
-        // Mark each event on the map where it happened (once the position is known).
-        if (navigator.hasFix) {
-            val now = System.currentTimeMillis()
-            val placed = navigator.events.map { MapEvent(now, navigator.currentLat, navigator.currentLon, it) }
-            _mapEvents.value = (_mapEvents.value + placed).takeLast(MAX_MAP_EVENTS)
-        }
-        navigator.events.clear()
-    }
+    /** The engine's event notes (stops, departures…) are not shown or logged: drop them. */
+    private fun drainMessages() = navigator.events.clear()
 
     private fun publish(force: Boolean) {
         val now = SystemClock.elapsedRealtime()

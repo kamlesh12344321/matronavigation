@@ -428,15 +428,6 @@ class EdgeCaseTest {
     }
 
     @Test
-    fun theLogSaysHowTheSpeedIsWorkedOut() {
-        rideIntoTunnel()
-        run(MotionState.MOVING, 5.0)
-        val d = nav.diagnostics()
-        assertTrue(d, d.startsWith("ENGINE: line profile"))
-        assertTrue(d, d.contains("next stop B") && d.contains("limits: top") && d.contains("stop signals:"))
-    }
-
-    @Test
     fun aTightCurveAheadSlowsTheRun() {
         // North for 1.5 km, then a 90° bend of about 100 m radius, then east to station B.
         val pts = (0..150).map { TrackPoint(12.90 + it * 0.0001, 77.0) } +
@@ -456,16 +447,6 @@ class EdgeCaseTest {
             if (kotlin.math.abs(along - bend) < 20.0) slowest = minOf(slowest, nav.state().speedMps)
         }
         assertTrue("through the bend at $slowest m/s", slowest < kotlin.math.sqrt(1.5 * 160.0))
-    }
-
-    @Test
-    fun theLogShowsTheAccelerationAlongTheTrackEachSecond() {
-        standingAtStationBThenLeaving()
-        nav.diagnostics()
-        riding(1.0) { 2.0 }
-        val d = nav.diagnostics()
-        assertTrue(d, d.contains("accel along track +0.00 m/s² (min +0.00, max +0.00, 10 samples)"))
-        assertFalse("reset after each line", nav.diagnostics().contains("accel along track"))
     }
 
     @Test

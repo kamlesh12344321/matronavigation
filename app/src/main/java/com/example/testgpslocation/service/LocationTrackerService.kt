@@ -15,7 +15,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.testgpslocation.MainActivity
 import com.example.testgpslocation.engine.NavigationController
-import com.example.testgpslocation.utils.NetworkStatus
+import com.example.testgpslocation.engine.PositionSource
 import com.example.testgpslocation.utils.TelemetryLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,8 +26,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Foreground service that keeps navigation running with the screen off and writes every
- * position (GPS, track-constrained or dead-reckoned) plus navigation events to the log file.
+ * Foreground service that keeps navigation running with the screen off and writes every position
+ * to the log file as one row: time, latitude, longitude and speed.
  */
 class LocationTrackerService : Service() {
 
@@ -66,32 +66,10 @@ class LocationTrackerService : Service() {
         started = true
         TelemetryLogger.startSession(this) // every start of logging gets its own file
         isRunning.value = true
-        TelemetryLogger.logCustom(this, "Logging started")
-        NavigationController.sessionInfo(this).forEach { TelemetryLogger.logCustom(this, it) }
 
         scope.launch {
             NavigationController.positions.collect { p ->
-                val extra = buildString {
-                    append(String.format(java.util.Locale.US, "Error: ±%.0f m", p.uncertaintyMeters))
-                    p.gpsAccuracyMeters?.let { append(String.format(java.util.Locale.US, " | GPS accuracy: %.0f m", it)) }
-                    append(" | Satellites used: ").append(p.satellitesUsed)
-                    p.altitudeMeters?.let { append(String.format(java.util.Locale.US, " | Altitude: %.1f m", it)) }
-                    p.headingDeg?.let { append(String.format(java.util.Locale.US, " | Heading: %.0f°", it)) }
-                    p.heightChangeMeters?.let { append(String.format(java.util.Locale.US, " | Height change: %+.1f m", it)) }
-                    p.lineName?.let { append(" | Line: ").append(it) }
-                    p.nextStation?.let { append(" | Next: ").append(it) }
-                    if (p.errorMeters != null && p.truthLatitude != null && p.truthLongitude != null) {
-                        append(String.format(java.util.Locale.US, " | TUNNEL TEST real GPS: %.6f, %.6f | Error: %.0f m",
-                            p.truthLatitude, p.truthLongitude, p.errorMeters))
-                    }
-                    if (p.mock) append(" | MOCK LOCATION")
-                    p.sensors?.let { append(" | ").append(it) }
-                }
-                TelemetryLogger.log(
-                    this@LocationTrackerService, p.timestamp, p.latitude, p.longitude, p.source.label,
-                    p.speedMps.toFloat(), if (p.gpsAvailable) "Acquired" else "Lost", NetworkStatus.label(this@LocationTrackerService),
-                    extra
-                )
+                TelemetryLogger.log(this@LocationTrackerService, p.timestamp, p.latitude, p.longitude, p.speedMps)
             }
         }
         scope.launch {
@@ -101,38 +79,19 @@ class LocationTrackerService : Service() {
             }
         }
         scope.launch {
-            NavigationController.messages.collect { TelemetryLogger.logCustom(this@LocationTrackerService, "EVENT: $it") }
-        }
-        scope.launch {
-            NavigationController.fixLog.collect { TelemetryLogger.logCustom(this@LocationTrackerService, it) }
-        }
-        scope.launch {
-            while (isActive) { // battery and heat: what an unattended box needs watching for
-                TelemetryLogger.logCustom(this@LocationTrackerService, deviceHealth())
-                delay(DEVICE_LOG_MS)
-            }
-        }
-        scope.launch {
             NavigationController.state.collect { s ->
                 val text = buildString {
-                    append(s.status)
+                    append(when {
+                        s.gpsAvailable -> "GPS"
+                        s.source == PositionSource.NONE -> "Waiting for location"
+                        else -> "No GPS · estimated position"
+                    })
                     s.nextStation?.let { append(" · next: ").append(it) }
                     s.distanceToNextMeters?.let { append(String.format(java.util.Locale.US, " (%.0f m)", it)) }
                 }
                 updateNotification(text)
             }
         }
-    }
-
-    private fun deviceHealth(): String {
-        val battery = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val level = battery?.let { b -> b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) * 100 / b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1) } ?: -1
-        val plugged = (battery?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
-        val tempC = (battery?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }?.let { it / 10.0 }
-        val pm = getSystemService(PowerManager::class.java)
-        val thermal = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) pm?.currentThermalStatus?.toString() ?: "?" else "?"
-        return String.format(java.util.Locale.US, "DEVICE: battery %d%%, charging %s, battery temperature %s °C, thermal status %s (0 = none, 3+ = the phone may slow down), screen %s",
-            level, if (plugged) "yes" else "no", tempC?.let { "%.1f".format(java.util.Locale.US, it) } ?: "?", thermal, if (pm?.isInteractive == true) "on" else "off")
     }
 
     private fun updateNotification(text: String) {
@@ -173,7 +132,6 @@ class LocationTrackerService : Service() {
         wakeLock = null
         if (started) {
             NavigationController.release(CLIENT)
-            TelemetryLogger.logCustom(this, "Logging stopped")
             TelemetryLogger.endSession()
         }
         isRunning.value = false
@@ -190,6 +148,5 @@ class LocationTrackerService : Service() {
         private const val CLIENT = "service"
         private const val MAX_WAKE_LOCK_MS = 12 * 60 * 60 * 1000L // safety cap: 12 h, renewed while logging
         private const val WAKE_LOCK_RENEW_MS = 60 * 60 * 1000L
-        private const val DEVICE_LOG_MS = 60_000L
     }
 }

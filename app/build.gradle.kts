@@ -8,7 +8,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.testgpslocation"
+        applicationId = "com.metronavigator.app" // the id the phone and the client see; code stays in com.example.testgpslocation
         minSdk = 24
         targetSdk = 34
         versionCode = 1

@@ -121,7 +121,7 @@
             android:src="@drawable/ic_more_vert" />
     </LinearLayout>
 
-    <!-- Bottom: compact navigation panel (tap for details) -->
+    <!-- Bottom: compact navigation panel -->
     <LinearLayout
         android:id="@+id/panel"
         android:layout_width="match_parent"
@@ -133,48 +133,6 @@
         android:paddingHorizontal="12dp"
         android:paddingTop="10dp"
         android:paddingBottom="2dp">
-
-        <!-- Test drive (no metro needed): shown while recording a route or testing on one -->
-        <LinearLayout
-            android:id="@+id/testDriveBar"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="4dp"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:visibility="gone"
-            tools:visibility="visible">
-
-            <TextView
-                android:id="@+id/testDriveText"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:textColor="#FFD54F"
-                android:textSize="12sp"
-                android:textStyle="bold"
-                tools:text="TUNNEL TEST · GPS hidden · error 23 m (avg 18, max 64)" />
-
-            <Button
-                android:id="@+id/btnTestDrivePrimary"
-                style="?android:attr/buttonBarButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:minWidth="0dp"
-                android:textColor="#00E5FF"
-                android:textSize="12sp"
-                tools:text="@string/end_tunnel" />
-
-            <Button
-                android:id="@+id/btnTestDriveSecondary"
-                style="?android:attr/buttonBarButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:minWidth="0dp"
-                android:textColor="#FF8A80"
-                android:textSize="12sp"
-                tools:text="@string/end_test" />
-        </LinearLayout>
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -252,7 +210,7 @@
             android:layout_height="wrap_content"
             android:textColor="#BDBDBD"
             android:textSize="12sp"
-            tools:text="42 km/h · 87° · 1240 m without GPS" />
+            tools:text="42 km/h" />
 
         <TextView
             android:id="@+id/destinationText"
@@ -265,96 +223,22 @@
             tools:text="Towards: Majestic · 4 stops"
             tools:visibility="visible" />
 
-        <!-- Details: hidden until the panel is tapped -->
-        <LinearLayout
-            android:id="@+id/details"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:orientation="vertical"
-            android:visibility="gone"
-            tools:visibility="visible">
-
-            <TextView
-                android:id="@+id/locationText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:text="@string/no_position"
-                android:textColor="#FFFFFF"
-                android:textSize="15sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:id="@+id/locationLabel"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:textColor="#BDBDBD"
-                android:textSize="11sp"
-                tools:text="No GPS · track navigation · satellites 0/12" />
-
-            <TextView
-                android:id="@+id/legendText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:textColor="#BDBDBD"
-                android:textSize="11sp"
-                tools:text="● GPS  ● Track  ● Network  ● Wi-Fi  ● Dead reckoning  ◆ Event" />
-
-            <TextView
-                android:id="@+id/offlineText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:textColor="#9E9E9E"
-                android:textSize="11sp"
-                tools:text="Metro line data: saved on phone (6 lines) — works offline" />
-
-            <TextView
-                android:id="@+id/tvLogFilePath"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:fontFamily="monospace"
-                android:textColor="#00E5FF"
-                android:textSize="11sp"
-                tools:text="Log: Download/TestGPSLocation/Metro_Navigator_telemetry_2026-11-02.txt" />
-        </LinearLayout>
-
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <Spinner
-                android:id="@+id/destinationSpinner"
+            <TextView
+                android:id="@+id/tvLogFilePath"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:backgroundTint="#BDBDBD"
-                android:popupBackground="#212121" />
-
-            <Button
-                android:id="@+id/btnFlipDirection"
-                style="?android:attr/buttonBarButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:minWidth="0dp"
-                android:text="@string/flip_direction"
-                android:textColor="#FFB74D"
-                android:textSize="12sp" />
-
-            <Button
-                android:id="@+id/btnMark"
-                style="?android:attr/buttonBarButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:minWidth="0dp"
-                android:text="@string/mark_stop"
-                android:textColor="#FFFFFF"
-                android:textSize="12sp"
-                android:visibility="gone" />
+                android:ellipsize="middle"
+                android:maxLines="2"
+                android:textColor="#9E9E9E"
+                android:textSize="11sp"
+                tools:text="Log: Download/MetroNavigator/Metro_Navigator_telemetry_2026-11-12_08-30-55.txt" />
 
             <Button
                 android:id="@+id/btnLogging"

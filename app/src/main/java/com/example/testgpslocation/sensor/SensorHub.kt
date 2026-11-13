@@ -63,7 +63,7 @@ data class DeviceCapabilities(
  * stationary / walking / moving classification. Falls back to the raw accelerometer (gravity
  * removed with a low-pass filter) on phones without a linear-acceleration sensor.
  *
- * Barometer: height change since the sensors started, for the log only (position never uses it).
+ * Barometer: height change since the sensors started (steady height = the train stands still).
  * Steps: the phone's own step detector, for following someone on foot without GPS.
  */
 class SensorHub(context: Context) : SensorEventListener {
@@ -72,7 +72,6 @@ class SensorHub(context: Context) : SensorEventListener {
         fun onLocationFix(point: GpsPoint)
         fun onGpsLost(elapsedMs: Long)
         fun onMotionSample(sample: MotionSample)
-        fun onSatellites(inView: Int, usedInFix: Int) {}
         fun onLastKnownFix(point: GpsPoint) {}
     }
 
@@ -86,7 +85,6 @@ class SensorHub(context: Context) : SensorEventListener {
     private val rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private val pressure = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
-    private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
     private val hasGnss = try { locationManager.allProviders.contains(LocationManager.GPS_PROVIDER) } catch (_: Exception) { false }
     private val hasPlayServices = try {
@@ -132,29 +130,15 @@ class SensorHub(context: Context) : SensorEventListener {
     private val accelMagnitudes = RingBuffer(ROLLING_SAMPLES)
     private val gyroMagnitudes = RingBuffer(ROLLING_SAMPLES)
 
-    // Logged only, to judge after a ride whether they show stops better
-    private val magneticMagnitudes = RingBuffer(ROLLING_SAMPLES)
-    private val accelChanges = RingBuffer(ROLLING_SAMPLES)
-    private var lastAccelMagnitude = Double.NaN
-    /** Spread of the magnetic field over ~2 s (µT): train motors should disturb it, a standing train less. */
-    val magneticSpread: Double get() = magneticMagnitudes.std() ?: Double.NaN
-    /** Spread of the change from sample to sample (m/s²): rails shake fast, a hand slowly. */
-    val fastVibration: Double get() = accelChanges.std() ?: Double.NaN
-
     private var stillSinceMs = 0L
     // Turn rate about the vertical (gravity) axis: magnetometer independent
     private var yawSum = 0.0
     private var yawCount = 0
 
-    /** Steps since the sensors started. */
-    var stepCount = 0; private set
-
     // Barometer: height change since the sensors started (metres), null without a barometer
     private var startHeightMeters = Float.NaN
     private var lastPressureMs = 0L
-    /** Last barometer reading (hPa), for the log. */
-    var lastPressureHpa = Float.NaN; private set
-    var heightChangeMeters: Double? = null; private set
+    private var heightChangeMeters: Double? = null
 
     private val gpsWatchdog = object : Runnable {
         override fun run() {
@@ -207,7 +191,6 @@ class SensorHub(context: Context) : SensorEventListener {
             var used = 0
             for (i in 0 until status.satelliteCount) if (status.usedInFix(i)) used++
             chipCheck.onSatelliteStatus(used, SystemClock.elapsedRealtime())
-            listener?.onSatellites(status.satelliteCount, used)
         }
     }
 
@@ -230,7 +213,6 @@ class SensorHub(context: Context) : SensorEventListener {
         heightChangeMeters = null
         chipCheck.reset()
         lastFusedFixMs = 0L
-        stepCount = 0
         stepsInWindow = 0
 
         if (fine && hasGnss) {
@@ -259,7 +241,6 @@ class SensorHub(context: Context) : SensorEventListener {
         rotationVector?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         gyroscope?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         pressure?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL, handler) }
-        magnetometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, handler) }
         ensureStepSensor()
         handler.postDelayed(gpsWatchdog, 1000L)
         isRunning = true
@@ -381,11 +362,7 @@ class SensorHub(context: Context) : SensorEventListener {
                 }
             }
             Sensor.TYPE_PRESSURE -> onPressure(event.values[0])
-            Sensor.TYPE_MAGNETIC_FIELD -> {
-                val x = event.values[0]; val y = event.values[1]; val z = event.values[2]
-                magneticMagnitudes.add(sqrt((x * x + y * y + z * z).toDouble()))
-            }
-            Sensor.TYPE_STEP_DETECTOR -> { stepsInWindow++; stepCount++ }
+            Sensor.TYPE_STEP_DETECTOR -> stepsInWindow++
         }
     }
 
@@ -394,8 +371,6 @@ class SensorHub(context: Context) : SensorEventListener {
         if (x.isNaN() || y.isNaN() || z.isNaN()) return
         val magnitude = sqrt(x * x + y * y + z * z)
         accelMagnitudes.add(magnitude)
-        if (!lastAccelMagnitude.isNaN()) accelChanges.add(magnitude - lastAccelMagnitude)
-        lastAccelMagnitude = magnitude
         if (hasRotation) {
             // Rotation matrix maps device coordinates to world (East, North, Up).
             sumEast += rotation[0] * x + rotation[1] * y + rotation[2] * z
@@ -452,7 +427,6 @@ class SensorHub(context: Context) : SensorEventListener {
         val height = SensorManager.getAltitude(SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hPa)
         if (startHeightMeters.isNaN()) startHeightMeters = height
         lastPressureMs = SystemClock.elapsedRealtime()
-        lastPressureHpa = hPa
         heightChangeMeters = (height - startHeightMeters).toDouble()
     }
 

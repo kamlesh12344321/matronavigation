@@ -20,9 +20,9 @@ import java.util.concurrent.Executors
 /**
  * Appends telemetry lines to a per-app text file.
  *
- * Location, in order of preference:
- *  - Android 10+: public Download/TestGPSLocation/ via MediaStore (no permission needed)
- *  - Android 9 and below: public Download/TestGPSLocation/ when WRITE_EXTERNAL_STORAGE is granted
+ * Location, in order of preference (the folder is the app's name without spaces, e.g. MetroNavigator):
+ *  - Android 10+: public Download/<AppName>/ via MediaStore (no permission needed)
+ *  - Android 9 and below: public Download/<AppName>/ when WRITE_EXTERNAL_STORAGE is granted
  *  - otherwise (or when the above fails): the app-specific external files dir
  *
  * One file per logging session: [startSession] (when logging starts) opens
@@ -34,7 +34,6 @@ import java.util.concurrent.Executors
 object TelemetryLogger {
     private const val TAG = "TelemetryLogger"
     private const val LOG_FILE_PREFIX = "telemetry"
-    private const val PUBLIC_SUBDIR = "TestGPSLocation"
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val dayFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
@@ -65,18 +64,22 @@ object TelemetryLogger {
 
     private fun today(): String = synchronized(dayFormat) { dayFormat.format(Date()) }
 
-    private fun fileName(context: Context, key: String): String {
-        val appName = try {
-            val label = context.applicationInfo.loadLabel(context.packageManager).toString()
-            label.takeIf { it.isNotBlank() }?.replace(Regex("[^a-zA-Z0-9_.-]"), "_")
-        } catch (_: Exception) {
-            null
-        } ?: context.packageName.substringAfterLast('.')
-        return "${appName}_${LOG_FILE_PREFIX}_$key.txt"
-    }
+    /** The app's name as shown on the phone ("Metro Navigator"). */
+    private fun appLabel(context: Context): String = try {
+        context.applicationInfo.loadLabel(context.packageManager).toString().takeIf { it.isNotBlank() }
+    } catch (_: Exception) {
+        null
+    } ?: context.packageName.substringAfterLast('.')
+
+    private fun fileName(context: Context, key: String): String =
+        "${appLabel(context).replace(Regex("[^a-zA-Z0-9_.-]"), "_")}_${LOG_FILE_PREFIX}_$key.txt"
+
+    /** Each app's own folder under Download: its name without spaces ("MetroNavigator"). */
+    private fun folder(context: Context): String = appLabel(context).replace(Regex("[^a-zA-Z0-9]"), "")
 
     /** Folder the log files go to, for display. */
-    const val FOLDER_DESCRIPTION = "Download/$PUBLIC_SUBDIR"
+    @JvmStatic
+    fun folderDescription(context: Context): String = "Download/${folder(context)}"
 
     /**
      * Starts a new log file for the writes that follow (lines already queued still go to the
@@ -98,34 +101,14 @@ object TelemetryLogger {
         writer.execute { sessionKey = null; target = null }
     }
 
+    /** One position row: time, latitude, longitude and speed, nothing else. */
     @JvmStatic
-    fun log(
-        context: Context,
-        timestamp: Long,
-        latitude: Double,
-        longitude: Double,
-        source: String, // "GPS" / "TRACK" / "DR"
-        speed: Float,
-        gpsStatus: String, // "Acquired" / "Lost"
-        networkStatus: String, // "Connected" / "Weak" / "Lost"
-        extra: String? = null // optional extra columns, appended as "| extra"
-    ) {
+    fun log(context: Context, timestamp: Long, latitude: Double, longitude: Double, speedMps: Double) {
         val appContext = context.applicationContext
         writer.execute {
-            val line = String.format(
-                Locale.US,
-                "[%s] Lat: %.6f, Lon: %.6f | Source: %s | Speed: %.2f m/s | GPS: %s | Network: %s",
-                dateFormat.format(Date(timestamp)), latitude, longitude, source, speed, gpsStatus, networkStatus
-            ) + (extra?.let { " | $it" } ?: "")
-            writeLine(appContext, line)
+            writeLine(appContext, String.format(Locale.US, "[%s] Lat: %.6f, Lon: %.6f | Speed: %.2f m/s",
+                dateFormat.format(Date(timestamp)), latitude, longitude, speedMps))
         }
-    }
-
-    @JvmStatic
-    fun logCustom(context: Context, message: String) {
-        val appContext = context.applicationContext
-        val now = System.currentTimeMillis()
-        writer.execute { writeLine(appContext, "[${dateFormat.format(Date(now))}] $message") }
     }
 
     /** Appends [line] exactly as given (a newline is added). */
@@ -221,7 +204,7 @@ object TelemetryLogger {
     private fun mediaStoreTarget(context: Context, key: String): Target? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         val name = fileName(context, key)
-        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/$PUBLIC_SUBDIR/"
+        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/${folder(context)}/"
         val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
         val resolver = context.contentResolver
 
@@ -239,13 +222,13 @@ object TelemetryLogger {
             put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
             put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
         }) ?: return null
-        return Target(uri, null, "Download/$PUBLIC_SUBDIR/$name", key)
+        return Target(uri, null, "Download/${folder(context)}/$name", key)
     }
 
     @Suppress("DEPRECATION")
     private fun legacyPublicTarget(context: Context, key: String): Target? {
         if (context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) return null
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), PUBLIC_SUBDIR)
+        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), folder(context))
         if (!dir.exists() && !dir.mkdirs()) return null
         val file = File(dir, fileName(context, key))
         return Target(null, file, file.absolutePath, key)

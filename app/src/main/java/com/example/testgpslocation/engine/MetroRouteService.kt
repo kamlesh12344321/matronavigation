@@ -18,7 +18,8 @@ import java.net.URL
 import java.net.URLEncoder
 
 sealed class DownloadResult {
-    data class Saved(val lines: Int) : DownloadResult()
+    /** [wholeCity] false: only the lines near here (the whole city could not be downloaded). */
+    data class Saved(val lines: Int, val wholeCity: Boolean = true) : DownloadResult()
     object AlreadyDownloaded : DownloadResult()
     object NothingHere : DownloadResult()
     object NoNetwork : DownloadResult()
@@ -125,43 +126,68 @@ class MetroRouteService(context: Context) {
     /**
      * Downloads every metro line within [radiusMeters] and saves it. [force] ignores the
      * "already downloaded" memory. Tries several Overpass servers in turn.
+     *
+     * A whole city (more than [SEARCH_RADIUS_METERS]) first saves the lines near here: a small,
+     * quick request, so the line about to be ridden is on the phone within a minute, even where
+     * the whole network is too big for the public servers (very large cities) or is not mapped as
+     * routes. Then the whole city; when that fails, the lines near here are what was saved.
      */
     suspend fun download(lat: Double, lon: Double, radiusMeters: Int = SEARCH_RADIUS_METERS, force: Boolean = false): DownloadResult =
         withContext(Dispatchers.IO) {
             downloadMutex.withLock {
                 if (!force && isAreaDownloaded(lat, lon)) return@withLock DownloadResult.AlreadyDownloaded
                 if (NetworkStatus.quality(appContext) == NetworkQuality.NONE) return@withLock DownloadResult.NoNetwork
+                if (radiusMeters <= SEARCH_RADIUS_METERS) return@withLock fetchArea(lat, lon, radiusMeters, wholeCity = false)
 
-                val city = radiusMeters > SEARCH_RADIUS_METERS
-                val query = buildOverpassQuery(lat, lon, radiusMeters, relationsOnly = city)
-                var lastError = "no server answered"
-                var json: String? = null
-                for (endpoint in OVERPASS_URLS) {
-                    val (body, error) = fetchJson(endpoint, query, if (city) CITY_READ_TIMEOUT_MS else READ_TIMEOUT_MS)
-                    if (body != null) { json = body; break }
-                    lastError = error ?: lastError
-                    if (NetworkStatus.quality(appContext) == NetworkQuality.NONE) return@withLock DownloadResult.NoNetwork
-                }
-                if (json == null) return@withLock DownloadResult.Failed(lastError)
-
-                val fetched = try {
-                    OverpassParser.parseAll(json)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Parse failed", e)
-                    return@withLock DownloadResult.Failed("bad data from server (${e.javaClass.simpleName})")
-                }
-                cacheMutex.withLock {
-                    val routes = loadCache()
-                    fetched.forEach { route ->
-                        routes.removeAll { it.id == route.id }
-                        routes.add(route)
-                        save(route)
+                val near = fetchArea(lat, lon, SEARCH_RADIUS_METERS, wholeCity = false)
+                if (near == DownloadResult.NoNetwork) return@withLock near
+                val whole = fetchArea(lat, lon, radiusMeters, wholeCity = true)
+                when {
+                    whole is DownloadResult.Saved -> whole
+                    near is DownloadResult.Saved -> DownloadResult.Saved(near.lines, wholeCity = false)
+                    whole == DownloadResult.NothingHere && near == DownloadResult.NothingHere -> {
+                        cacheMutex.withLock { markAreaDownloaded(lat, lon, radiusMeters) } // really nothing: not asked again for a while
+                        whole
                     }
-                    markAreaDownloaded(lat, lon, radiusMeters)
+                    else -> whole
                 }
-                if (fetched.isEmpty()) DownloadResult.NothingHere else DownloadResult.Saved(fetched.size)
             }
         }
+
+    /**
+     * One request for the lines within [radius], saved. The area is remembered as downloaded when
+     * lines came back, or for the small request when there were none (an empty whole-city answer
+     * may only mean the city's lines are not mapped as routes).
+     */
+    private suspend fun fetchArea(lat: Double, lon: Double, radius: Int, wholeCity: Boolean): DownloadResult {
+        val query = buildOverpassQuery(lat, lon, radius, relationsOnly = wholeCity)
+        var lastError = "no server answered"
+        var json: String? = null
+        for (endpoint in OVERPASS_URLS) {
+            val (body, error) = fetchJson(endpoint, query, if (wholeCity) CITY_READ_TIMEOUT_MS else READ_TIMEOUT_MS)
+            if (body != null) { json = body; break }
+            lastError = error ?: lastError
+            if (NetworkStatus.quality(appContext) == NetworkQuality.NONE) return DownloadResult.NoNetwork
+        }
+        if (json == null) return DownloadResult.Failed(lastError)
+
+        val fetched = try {
+            OverpassParser.parseAll(json)
+        } catch (e: Exception) {
+            Log.e(TAG, "Parse failed", e)
+            return DownloadResult.Failed("bad data from server (${e.javaClass.simpleName})")
+        }
+        cacheMutex.withLock {
+            val routes = loadCache()
+            fetched.forEach { route ->
+                routes.removeAll { it.id == route.id }
+                routes.add(route)
+                save(route)
+            }
+            if (fetched.isNotEmpty() || !wholeCity) markAreaDownloaded(lat, lon, radius)
+        }
+        return if (fetched.isEmpty()) DownloadResult.NothingHere else DownloadResult.Saved(fetched.size)
+    }
 
     /** Number of saved lines (after [preload]). */
     val cachedLineCount: Int get() = cached?.size ?: 0
@@ -301,7 +327,7 @@ class MetroRouteService(context: Context) {
     }
 }
 
-/** The saved form of a [MetroRoute] (offline metro lines, test-drive routes) and of a [RideState]. */
+/** The saved form of a [MetroRoute] (offline metro lines) and of a [RideState]. */
 object RouteJson {
     const val VERSION = 2
 

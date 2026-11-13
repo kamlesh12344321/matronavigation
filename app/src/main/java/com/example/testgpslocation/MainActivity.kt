@@ -11,21 +11,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.ImageButton
 import android.widget.PopupMenu
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -33,12 +26,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.testgpslocation.engine.MetroRouteService
-import com.example.testgpslocation.engine.MotionState
 import com.example.testgpslocation.engine.NavState
 import com.example.testgpslocation.engine.NavigationController
 import com.example.testgpslocation.engine.PositionSource
-import com.example.testgpslocation.engine.TestDriveMode
-import com.example.testgpslocation.engine.TestDriveState
 import com.example.testgpslocation.map.NavigationOverlay
 import com.example.testgpslocation.sensor.SensorHub
 import com.example.testgpslocation.service.LocationTrackerService
@@ -71,30 +61,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusIndicator: TextView
     private lateinit var networkText: TextView
     private lateinit var btnRecenter: ImageButton
-    private lateinit var details: View
-    private lateinit var locationText: TextView
-    private lateinit var locationLabel: TextView
     private lateinit var lineText: TextView
     private lateinit var currentStationText: TextView
     private lateinit var nextStationText: TextView
     private lateinit var distToNextText: TextView
     private lateinit var metricsText: TextView
     private lateinit var destinationText: TextView
-    private lateinit var destinationSpinner: Spinner
-    private lateinit var offlineText: TextView
     private lateinit var confidenceVal: TextView
     private lateinit var btnLogging: Button
-    private lateinit var btnMark: Button
     private lateinit var logFileText: TextView
-    private lateinit var testDriveBar: View
-    private lateinit var testDriveText: TextView
-    private lateinit var btnTestDrivePrimary: Button
-    private lateinit var btnTestDriveSecondary: Button
 
-    private var spinnerStations: List<String> = emptyList()
-    private var updatingSpinner = false
     private var tracking = false
-    private var cachedLines = 0
     private var permissionAskedOnce = false
     private var shownWarning: String? = null
 
@@ -119,51 +96,21 @@ class MainActivity : AppCompatActivity() {
         statusIndicator = findViewById(R.id.statusIndicator)
         networkText = findViewById(R.id.networkText)
         btnRecenter = findViewById(R.id.btnRecenter)
-        details = findViewById(R.id.details)
-        locationText = findViewById(R.id.locationText)
-        locationLabel = findViewById(R.id.locationLabel)
         lineText = findViewById(R.id.lineText)
         currentStationText = findViewById(R.id.currentStationText)
         nextStationText = findViewById(R.id.nextStationText)
         distToNextText = findViewById(R.id.distToNextText)
         metricsText = findViewById(R.id.metricsText)
         destinationText = findViewById(R.id.destinationText)
-        destinationSpinner = findViewById(R.id.destinationSpinner)
-        offlineText = findViewById(R.id.offlineText)
         confidenceVal = findViewById(R.id.confidenceVal)
         btnLogging = findViewById(R.id.btnLogging)
-        btnMark = findViewById(R.id.btnMark)
-        testDriveBar = findViewById(R.id.testDriveBar)
-        testDriveText = findViewById(R.id.testDriveText)
-        btnTestDrivePrimary = findViewById(R.id.btnTestDrivePrimary)
-        btnTestDriveSecondary = findViewById(R.id.btnTestDriveSecondary)
 
         setupMap()
         logFileText = findViewById(R.id.tvLogFilePath)
-        findViewById<TextView>(R.id.legendText).text = legend()
-        findViewById<View>(R.id.panel).setOnClickListener { toggleDetails() }
         findViewById<View>(R.id.mapAttribution).setOnClickListener { safeStart(Intent(Intent.ACTION_VIEW, Uri.parse(OSM_COPYRIGHT_URL))) }
 
-        setupSpinner(emptyList())
-        destinationSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                if (!updatingSpinner) NavigationController.setDestination(if (position == 0) null else position - 1)
-            }
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
-        findViewById<Button>(R.id.btnFlipDirection).setOnClickListener { NavigationController.flipDirection() }
         findViewById<ImageButton>(R.id.btnMenu).setOnClickListener(::showMenu)
         btnRecenter.setOnClickListener { setFollowing(true); centreOnPosition(fromButton = true) }
-        btnTestDrivePrimary.setOnClickListener { onTestDrivePrimary() }
-        btnTestDriveSecondary.setOnClickListener { onTestDriveSecondary() }
-
-        // While testing: tap when the train really stops and when it leaves. The log then has the
-        // real times next to what the app estimated, without writing them down by hand.
-        btnMark.setOnClickListener {
-            val stopped = btnMark.text == getString(R.string.mark_stop)
-            NavigationController.markByUser(stopped)
-            btnMark.setText(if (stopped) R.string.mark_leave else R.string.mark_stop)
-        }
 
         btnLogging.setOnClickListener {
             if (LocationTrackerService.isRunning.value) {
@@ -181,18 +128,13 @@ class MainActivity : AppCompatActivity() {
                 launch { NavigationController.state.collect(::render) }
                 launch { NavigationController.route.collect { overlay.route = it; map.invalidate() } }
                 launch { NavigationController.trail.collect { overlay.trail = it; map.invalidate() } }
-                launch { NavigationController.mapEvents.collect { overlay.events = it; map.invalidate() } }
-                launch { NavigationController.truthTrail.collect { overlay.truthTrail = it; map.invalidate() } }
-                launch { NavigationController.testDrive.collect(::renderTestDrive) }
-                launch { NavigationController.cachedLines.collect { cachedLines = it } }
-                launch { NavigationController.lineStatus.collect { offlineText.text = it } }
+                launch { NavigationController.lineStatus.collect { render(NavigationController.state.value) } }
                 launch {
                     LocationTrackerService.isRunning.collect { running ->
                         btnLogging.setText(if (running) R.string.stop_logging else R.string.start_logging)
                         btnLogging.setTextColor(if (running) STOP_COLOR else START_COLOR)
-                        btnMark.visibility = if (running) View.VISIBLE else View.GONE
-                        logFileText.text = TelemetryLogger.currentFileName?.let { getString(R.string.log_current_file, TelemetryLogger.FOLDER_DESCRIPTION, it) }
-                            ?: getString(R.string.log_new_file_each_start, TelemetryLogger.FOLDER_DESCRIPTION)
+                        logFileText.text = TelemetryLogger.currentFileName?.let { getString(R.string.log_current_file, TelemetryLogger.folderDescription(this@MainActivity), it) }
+                            ?: getString(R.string.log_new_file_each_start, TelemetryLogger.folderDescription(this@MainActivity))
                         refreshWarnings()
                     }
                 }
@@ -302,17 +244,13 @@ class MainActivity : AppCompatActivity() {
     private fun showMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
             inflate(R.menu.map_menu)
-            menu.findItem(R.id.menuDetails).setTitle(if (details.visibility == View.VISIBLE) R.string.hide_details else R.string.show_details)
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
-                    R.id.menuTestDrive -> showTestDriveDialog()
-                    R.id.menuDetails -> toggleDetails()
                     R.id.menuClearMap -> {
                         NavigationController.clearMap()
                         Toast.makeText(this@MainActivity, R.string.map_cleared, Toast.LENGTH_SHORT).show()
                     }
-                    R.id.menuRefreshLines -> NavigationController.refreshLinesHere()
-                    R.id.menuDownloadCity -> NavigationController.downloadCity()
+                    R.id.menuUpdateLines -> NavigationController.downloadCity()
                 }
                 true
             }
@@ -320,121 +258,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---- Test drive (no metro needed) ---------------------------------------------------------
-
-    private fun showTestDriveDialog() {
-        val routes = NavigationController.savedTestRoutes()
-        val labels = listOf(getString(R.string.test_drive_record)) +
-            routes.map { String.format(Locale.US, "Drive again: %s (%.1f km, %d stations)", it.lineName, it.length / 1000.0, it.stations.size) } +
-            (if (routes.isEmpty()) emptyList() else listOf(getString(R.string.test_drive_delete_all)))
-        AlertDialog.Builder(this)
-            .setTitle(R.string.test_drive)
-            .setItems(labels.toTypedArray()) { _, i ->
-                when {
-                    i == 0 -> {
-                        NavigationController.startRecordingTestRoute()
-                        ensureLogging()
-                        Toast.makeText(this, R.string.test_drive_record_help, Toast.LENGTH_LONG).show()
-                    }
-                    i <= routes.size -> {
-                        NavigationController.rideTestRoute(routes[i - 1])
-                        ensureLogging()
-                        Toast.makeText(this, R.string.test_drive_ride_help, Toast.LENGTH_LONG).show()
-                    }
-                    else -> AlertDialog.Builder(this)
-                        .setMessage(R.string.test_drive_delete_confirm)
-                        .setPositiveButton(R.string.delete) { _, _ -> NavigationController.deleteTestRoutes() }
-                        .setNegativeButton(android.R.string.cancel, null)
-                        .show()
-                }
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
-    /** A test drive is only useful with its log: start logging if it is not running. */
-    private fun ensureLogging() {
-        if (!LocationTrackerService.isRunning.value && hasFineLocation()) {
-            ContextCompat.startForegroundService(this, Intent(this, LocationTrackerService::class.java))
-        }
-    }
-
-    private fun renderTestDrive(t: TestDriveState) {
-        testDriveBar.visibility = if (t.mode == TestDriveMode.OFF) View.GONE else View.VISIBLE
-        when (t.mode) {
-            TestDriveMode.OFF -> return
-            TestDriveMode.RECORDING -> {
-                testDriveText.text = String.format(Locale.US, "● Recording test route · %.2f km · stations: %d", t.recordedMeters / 1000.0, t.recordedStations)
-                btnTestDrivePrimary.setText(R.string.mark_station)
-                btnTestDriveSecondary.setText(R.string.finish)
-            }
-            TestDriveMode.READY -> {
-                testDriveText.text = String.format(Locale.US, "%s · GPS on", t.routeName ?: "Test route")
-                btnTestDrivePrimary.setText(R.string.start_tunnel)
-                btnTestDriveSecondary.setText(R.string.end_test)
-            }
-            TestDriveMode.TUNNEL -> {
-                testDriveText.text = if (t.lastErrorMeters == null) "TUNNEL TEST · GPS hidden · waiting for real GPS to compare"
-                else String.format(Locale.US, "TUNNEL TEST · GPS hidden · error %.0f m (avg %.0f, max %.0f)",
-                    t.lastErrorMeters, t.meanErrorMeters ?: 0.0, t.maxErrorMeters ?: 0.0)
-                btnTestDrivePrimary.setText(R.string.end_tunnel)
-                btnTestDriveSecondary.setText(R.string.end_test)
-            }
-        }
-    }
-
-    private fun onTestDrivePrimary() {
-        when (NavigationController.testDrive.value.mode) {
-            TestDriveMode.RECORDING -> if (!NavigationController.markTestStation()) {
-                Toast.makeText(this, R.string.test_drive_mark_failed, Toast.LENGTH_SHORT).show()
-            }
-            TestDriveMode.READY -> if (!NavigationController.startTunnelTest()) {
-                Toast.makeText(this, R.string.test_drive_need_position, Toast.LENGTH_SHORT).show()
-            }
-            TestDriveMode.TUNNEL -> NavigationController.endTunnelTest()
-            TestDriveMode.OFF -> {}
-        }
-    }
-
-    private fun onTestDriveSecondary() {
-        when (NavigationController.testDrive.value.mode) {
-            TestDriveMode.RECORDING -> if (NavigationController.finishRecordingTestRoute() == null) {
-                Toast.makeText(this, R.string.test_drive_too_short, Toast.LENGTH_LONG).show()
-            }
-            TestDriveMode.READY, TestDriveMode.TUNNEL -> NavigationController.endTestDrive()
-            TestDriveMode.OFF -> {}
-        }
-    }
-
-    private fun toggleDetails() {
-        details.visibility = if (details.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-    }
-
-    /** What each marker colour means. */
-    private fun legend(): CharSequence = SpannableStringBuilder().apply {
-        listOf(
-            PositionSource.GPS to "GPS", PositionSource.NETWORK to "Network", PositionSource.ESTIMATE to "GPS estimate",
-            PositionSource.TRACK to "Track",
-            PositionSource.DEAD_RECKONING to "Dead reckoning"
-        ).forEach { (source, name) ->
-            append("●", ForegroundColorSpan(NavigationOverlay.colorFor(source)), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            append(" $name   ")
-        }
-        append("◆", ForegroundColorSpan(NavigationOverlay.EVENT_COLOR), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        append(" Event   ")
-        append("━", ForegroundColorSpan(NavigationOverlay.TRUTH_COLOR), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        append(" Real GPS in a tunnel test (tap a marker for details)")
-    }
-
     // ---- Rendering --------------------------------------------------------------------------
 
     private fun render(s: NavState) {
         val (label, color) = when {
             s.gpsAvailable -> "GPS ACTIVE" to "#4CAF50"
-            s.source == PositionSource.TRACK -> "NO GPS · UNDERGROUND NAV" to "#FFB300"
-            s.source == PositionSource.NETWORK -> "NO GPS · NETWORK LOCATION" to "#FFB300"
-            s.source == PositionSource.ESTIMATE -> "NO GPS · PHONE ESTIMATE" to "#FFB300"
-            s.source == PositionSource.DEAD_RECKONING -> "NO GPS · DEAD RECKONING" to "#FF7043"
+            s.source != PositionSource.NONE -> "NO GPS · ESTIMATED POSITION" to "#FFB300"
             else -> "WAITING FOR LOCATION" to "#9E9E9E"
         }
         statusIndicator.text = label
@@ -445,67 +274,31 @@ class MainActivity : AppCompatActivity() {
         if (following || !centredOnce) centreOnPosition(fromButton = false)
         map.invalidate()
 
-        locationText.text = if (s.source == PositionSource.NONE) getString(R.string.no_position)
-        else String.format(Locale.US, "%.6f, %.6f", s.latitude, s.longitude)
-        val sats = NavigationController.satellites.value
-        locationLabel.text = buildString {
-            append(s.status)
-            append(" · ").append(s.source.label)
-            s.gpsAccuracyMeters?.let { append(String.format(Locale.US, " · accuracy %.0f m", it)) }
-            append(" · satellites ${sats.usedInFix}/${sats.inView}")
-            if (!s.gpsAvailable && s.motion != MotionState.MOVING && s.source != PositionSource.NONE) append(" · ").append(s.motion.name.lowercase())
-            s.lastRecoveryDriftMeters?.let { append(String.format(Locale.US, " · last GPS-recovery error %.0f m", it)) }
-            if (s.networkCorrections > 0) append(" · ${s.networkCorrections} network fixes")
-            if (s.curveCorrections > 0) append(" · ${s.curveCorrections} curve fixes")
-        }
-
+        // No line yet: what the line data is doing (loading, downloading, none near here).
         lineText.text = s.lineName?.let { if (s.onTrack) "🚇 $it" else "🚇 $it (not on this line)" }
-            ?: if (cachedLines > 0 && s.gpsAvailable) "No metro line within 400 m" else getString(R.string.searching_line)
+            ?: NavigationController.lineStatus.value
         currentStationText.text = s.previousStation ?: getString(R.string.dash)
         nextStationText.text = s.nextStation?.let { "→ $it" } ?: getString(R.string.dash)
         showOrHide(distToNextText, when {
             s.distanceToNextMeters == null -> if (s.onTrack) "End of line" else ""
             else -> String.format(Locale.US, "Next stop in %.0f m · ~%s", s.distanceToNextMeters, formatEta(s.etaNextSec ?: 0))
         })
-        metricsText.text = buildString {
-            append(String.format(Locale.US, "%.0f km/h · %.0f°", s.speedMps * 3.6, s.headingDeg))
-            if (!s.gpsAvailable && s.source != PositionSource.NONE) {
-                append(String.format(Locale.US, " · %.0f m without GPS", s.distanceSinceGpsLossMeters))
-            }
-        }
+        metricsText.text = String.format(Locale.US, "%.0f km/h", s.speedMps * 3.6)
         showOrHide(destinationText, when {
-            s.destination == null -> ""
+            s.destination == null || !s.directionKnown -> "" // a guess is not shown
             s.stopsRemaining != null -> "Towards: ${s.destination} · ${s.stopsRemaining} stop(s)"
-            else -> "Towards: ${s.destination}" + if (s.directionKnown) "" else " (direction not confirmed — tap Flip if wrong)"
+            else -> "Towards: ${s.destination}"
         })
         confidenceVal.text = if (s.source == PositionSource.NONE) "—" else String.format(Locale.US, "±%.0f m", s.uncertaintyMeters)
         confidenceVal.setTextColor(Color.parseColor(when (s.confidence) {
             "HIGH" -> "#4CAF50"; "MEDIUM" -> "#FFD600"; "LOW" -> "#FF9800"; else -> "#F44336"
         }))
-
-        if (s.stationNames != spinnerStations) setupSpinner(s.stationNames)
-        val wanted = (s.destinationIndex ?: -1) + 1
-        if (destinationSpinner.selectedItemPosition != wanted && wanted < destinationSpinner.count) {
-            updatingSpinner = true
-            destinationSpinner.setSelection(wanted, false)
-            updatingSpinner = false
-        }
         refreshWarnings(s)
     }
 
     private fun showOrHide(view: TextView, text: String) {
         view.text = text
         view.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
-    }
-
-    private fun setupSpinner(stations: List<String>) {
-        spinnerStations = stations
-        updatingSpinner = true
-        val items = listOf(getString(R.string.auto_direction)) + stations.map { "Destination: $it" }
-        destinationSpinner.adapter = ArrayAdapter(this, R.layout.item_spinner, items)
-        destinationSpinner.setSelection(0, false)
-        destinationSpinner.isEnabled = stations.isNotEmpty()
-        updatingSpinner = false
     }
 
     private fun formatEta(sec: Int) = if (sec < 60) "${sec}s" else "${sec / 60} min"
@@ -548,11 +341,7 @@ class MainActivity : AppCompatActivity() {
             caps != null && !caps.hasLinearAcceleration && !caps.hasAccelerometer ->
                 Warning("This phone has no motion sensors: underground navigation cannot estimate movement.", null)
             caps != null && !caps.hasGnss -> Warning("This phone has no GPS receiver: only network location is available.", null)
-            caps != null && !caps.hasRotationVector ->
-                Warning("No orientation sensor: pick your destination so the direction of travel is known.", null)
             s.mockLocation -> Warning("Mock (fake) GPS locations detected; results are not real.", null)
-            caps != null && !caps.hasBarometer -> Warning("This phone has no barometer: stops in a tunnel will be harder to see.", null)
-            !hasStepPermission() -> Warning("Allow Physical activity so walking can be followed without GPS.") { openAppSettings() }
             else -> null
         }
     }
@@ -615,7 +404,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun hasStepPermission() = SensorHub.hasStepPermission(this)
 
-    /** Asked once: after a refusal the warning's Fix leads to Settings, without restarting the sensors on every open. */
+    /** Asked once, so a refusal does not bring the question back on every open. */
     private fun stepPermissionAsked() = getSharedPreferences(WARNING_PREFS, MODE_PRIVATE).getBoolean(KEY_STEP_PERMISSION_ASKED, false)
 
     private fun hasAnyLocation() = hasFineLocation() ||
